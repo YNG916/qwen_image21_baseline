@@ -65,10 +65,10 @@ def main():
             raise ValueError("Implementation changed; create a new experiment")
     if any(a.split("=", 1)[0] in ("--config", "--output") for a in arguments):
         p.error("Runner owns --config and --output")
-    if args.processes < 1 or (args.processes != 1 and args.kind != "train"):
-        p.error("Multiple processes are supported only for train")
+    if args.processes < 1 or (args.processes != 1 and args.kind not in ("train", "prepare")):
+        p.error("Multiple processes are supported only for train/prepare")
     command = [sys.executable]
-    if args.kind == "train":
+    if args.kind in ("train", "prepare"):
         command += ["-m", "accelerate.commands.launch", "--num_processes", str(args.processes), "--mixed_precision", "bf16"]
         if args.processes > 1:
             command += ["--multi_gpu"]

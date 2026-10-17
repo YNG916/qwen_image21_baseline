@@ -61,6 +61,10 @@ def load_config(path):
         raise ValueError("First implementation requires alpha == rank > 0 for portable LoRA scaling")
     if any(settings[k] < 1 for k in ("gradient_accumulation_steps", "max_steps", "checkpoint_every")):
         raise ValueError("Training counts must be positive")
+    if type(settings.get("micro_batch_size", 1)) is not int or settings.get("micro_batch_size", 1) < 1:
+        raise ValueError("micro_batch_size must be a positive integer")
+    if type(settings.get("gradient_checkpointing", True)) is not bool:
+        raise ValueError("gradient_checkpointing must be boolean")
     return config
 
 

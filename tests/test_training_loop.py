@@ -11,7 +11,7 @@ import torch
 from peft import utils as peft_utils
 from safetensors.torch import load_file, save_file
 
-from qwen_mvwd.backend import train
+from qwen_mvwd.backend import train, batch_layout
 from qwen_mvwd.common import digest, file_hash, implementation_hash, write_json
 
 
@@ -48,13 +48,14 @@ class Scheduler:
 
 
 class TrainingLoopTests(unittest.TestCase):
+    micro_batch = 1
     def test_actual_loop_resume_and_validation_preserve_training(self):
         fake = types.ModuleType('diffusers')
         fake.QwenImage21Pipeline = Pipeline
         fake.QwenImage21Transformer2DModel = Tiny
         fake.FlowMatchEulerDiscreteScheduler = Scheduler
         config = {'training': {'rank': 1, 'alpha': 1, 'seed': 42, 'max_steps': 4,
-                              'gradient_accumulation_steps': 2, 'learning_rate': 0.01, 'checkpoint_every': 2}}
+                              'micro_batch_size': self.micro_batch, 'gradient_accumulation_steps': 2, 'learning_rate': 0.01, 'checkpoint_every': 2}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for split, count in (('train', 3), ('val', 2)):
@@ -66,7 +67,7 @@ class TrainingLoopTests(unittest.TestCase):
                         'image_mask': torch.ones((1, 4), dtype=torch.bool),
                         'prompt_embeds': torch.zeros(1, 4, 2), 'prompt_mask': None, 'query': {'index': i}}
                     path = cache / f'{i}.pt'; torch.save(sample, path)
-                    rows.append({'path': path.name, 'sha256': file_hash(path), 'query': sample['query']})
+                    rows.append({'path': path.name, 'sha256': file_hash(path), 'query': sample['query'], 'batch_layout': batch_layout(sample)})
                 write_json(cache / 'manifest.json', {'config_sha256': digest(config), 'cache_identity': split,
                     'dataset': {'split': split}, 'complete': True, 'implementation_sha256': implementation_hash(), 'samples': rows})
             def get_state(model):
@@ -89,12 +90,17 @@ class TrainingLoopTests(unittest.TestCase):
                         self.assertTrue(torch.equal(expected[key], actual[key]), name)
                 def rows(name):
                     return [json.loads(s) for s in (root / name / 'loss.jsonl').read_text().splitlines()]
-                self.assertEqual(rows('full'), rows('part') + rows('resumed'))
+                self.assertEqual([{k:v for k,v in r.items() if k not in ('elapsed_seconds','samples_per_second')} for r in rows('full')],
+                                 [{k:v for k,v in r.items() if k not in ('elapsed_seconds','samples_per_second')} for r in rows('part') + rows('resumed')])
                 full = json.loads((root / 'full/final/metadata.json').read_text())
                 resumed = json.loads((root / 'resumed/final/metadata.json').read_text())
                 self.assertEqual(full['progress'], resumed['progress'])
-                self.assertEqual(full['progress'], {'step': 4, 'epoch': 2, 'cursor': 0, 'global_samples_seen': 8})
+                self.assertEqual(full['progress'], {'step': 4, 'epoch': 2 * self.micro_batch, 'cursor': 0, 'global_samples_seen': 8 * self.micro_batch})
                 # Changed validation protocol cannot silently continue the same run.
                 with self.assertRaisesRegex(ValueError, 'identical config'):
                     train(config, root / 'train', root / 'bad', resume_from=root / 'part/final',
                           validation_cache=root / 'val', validate_every=2)
+
+
+class BatchedTrainingLoopTests(TrainingLoopTests):
+    micro_batch = 2

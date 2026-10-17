@@ -44,34 +44,63 @@ def inspect(config, args):
 
 def prepare(config, args):
     import torch
-    from .backend import encode_sample, load_pipeline, require_gpu
+    from accelerate import Accelerator
+    from .backend import batch_layout, encode_sample, load_pipeline, require_gpu
+    from .common import read_json
     require_gpu()
     if args.split not in ("train", "val"):
         raise ValueError("Feature caches accept train/val only; no test supervision during development")
+    accelerator = Accelerator(mixed_precision="bf16")
     data = select_data(config, args)
     output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=False)
     receipt = {"schema": "qwen-mvwd-features-v1", "complete": False,
         "config_sha256": digest(config), "cache_identity": data.cache_identity(),
         "dataset": data.provenance(), "implementation_sha256": implementation_hash(), "samples": []}
-    write_json(output / "manifest.json", receipt)
+    if accelerator.is_main_process:
+        output.mkdir(parents=True, exist_ok=False)
+        write_json(output / "manifest.json", receipt)
+    accelerator.wait_for_everyone()
+    rank_dir = output / f"rank_{accelerator.process_index:04d}"
+    rank_dir.mkdir(exist_ok=False)
     pipe = load_pipeline(config, encoding_only=True)
     queries = data.queries()
     if args.max_samples is not None:
         if args.max_samples < 1:
             raise ValueError("max_samples must be positive")
         queries = itertools.islice(queries, args.max_samples)
+    rows = []
     for i, query in enumerate(queries):
+        if i % accelerator.num_processes != accelerator.process_index:
+            continue
         condition = data.conditions(query)
         sample = encode_sample(pipe, condition, data.target(query), config["bev_size"])
-        name = f"sample_{i:07d}.pt"
-        torch.save(sample, output / name)
-        receipt["samples"].append({"path": name, "query": query, "sha256": file_hash(output / name)})
+        path = rank_dir / f"sample_{i:07d}.pt"
+        torch.save(sample, path)
+        rows.append({"path": str(path.relative_to(output)), "query": query, "sha256": file_hash(path),
+                     "batch_layout": batch_layout(sample), "query_index": i})
+        if len(rows) % 32 == 0:
+            write_json(rank_dir / "manifest.json", {"complete": False, "samples": rows})
+            print(f"Rank {accelerator.process_index}: cached {len(rows)} samples", flush=True)
+    write_json(rank_dir / "manifest.json", {"complete": True, "samples": rows})
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        merged = []
+        for rank in range(accelerator.num_processes):
+            part = read_json(output / f"rank_{rank:04d}" / "manifest.json")
+            if not part["complete"]:
+                raise ValueError("Incomplete feature shard")
+            merged.extend(part["samples"])
+        merged.sort(key=lambda row: row["query_index"])
+        if [r["query_index"] for r in merged] != list(range(len(merged))):
+            raise ValueError("Feature shards have duplicate/missing query indices")
+        receipt["samples"] = merged
+        receipt["complete"] = True
+        receipt["encoding_processes"] = accelerator.num_processes
+        receipt["selection_limited"] = args.max_samples is not None or args.max_episodes is not None or bool(args.scene) or bool(getattr(args, "selection", None))
         write_json(output / "manifest.json", receipt)
-        print(f"Cached {i+1} samples", flush=True)
-    receipt["complete"] = True
-    receipt["selection_limited"] = args.max_samples is not None or args.max_episodes is not None or bool(args.scene) or bool(getattr(args, "selection", None))
-    write_json(output / "manifest.json", receipt)
+        print(f"Completed {len(merged)} cached samples across {accelerator.num_processes} GPUs", flush=True)
+    accelerator.wait_for_everyone()
+    accelerator.end_training()
 
 
 def infer(config, args):

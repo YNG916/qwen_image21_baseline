@@ -21,6 +21,19 @@ class TrainingStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_progress({'step': 2, 'epoch': 0, 'cursor': 6, 'global_samples_seen': 12}, 7, 2, 3)
 
+    def test_exact_layout_batches_cover_samples_and_resume_boundaries(self):
+        layouts = ["a"] * 5 + ["b"] * 3 + ["c"]
+        order = epoch_indices(9, 42, 0, 2, 2, 2, layouts)
+        self.assertEqual(set(order), set(range(9)))
+        self.assertEqual(len(order) % 8, 0)
+        for offset in range(0, len(order), 2):
+            self.assertEqual(len({layouts[i] for i in order[offset:offset+2]}), 1)
+        self.assertEqual(order, epoch_indices(9, 42, 0, 2, 2, 2, layouts))
+        self.assertNotEqual(order, epoch_indices(9, 42, 1, 2, 2, 2, layouts))
+        updates = len(order) // 8
+        check_progress({"step": updates, "epoch": 1, "cursor": 0, "global_samples_seen": len(order)},
+                       9, 2, 2, 2, len(order))
+
     def test_optimizer_rng_and_next_sample_match_uninterrupted(self):
         random.seed(5); np.random.seed(5); torch.manual_seed(5)
         generator = torch.Generator().manual_seed(5)

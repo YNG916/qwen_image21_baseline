@@ -71,6 +71,29 @@ def encode_sample(pipe, condition, target, resolution):
             "image_mask": image_mask.cpu().contiguous(), "query": condition["query"]}
 
 
+def batch_layout(sample):
+    """The pinned transformer shares RoPE/image positions across the whole batch."""
+    from .common import digest
+    return digest({"target": list(sample["target"].shape[1:]),
+        "conditions": [list(x.shape[1:]) for x in sample["conditions"]],
+        "prompt": list(sample["prompt_embeds"].shape[1:]),
+        "image_mask": sample["image_mask"].tolist()})
+
+
+def collate_samples(samples):
+    """Exact layouts only: padding text would move target RoPE positions."""
+    import torch
+    if not samples or len({batch_layout(s) for s in samples}) != 1:
+        raise ValueError("A microbatch requires identical prompt/image layouts")
+    return {"target": torch.cat([s["target"] for s in samples]),
+        "conditions": [torch.cat([s["conditions"][i] for s in samples]) for i in range(len(samples[0]["conditions"]))],
+        "prompt_embeds": torch.cat([s["prompt_embeds"] for s in samples]),
+        "prompt_mask": None if all(s["prompt_mask"] is None for s in samples) else torch.cat([
+            s["prompt_mask"] if s["prompt_mask"] is not None else torch.ones(s["image_mask"].shape, dtype=torch.bool)
+            for s in samples]),
+        "image_mask": torch.cat([s["image_mask"] for s in samples])}
+
+
 def flow_loss(transformer, sample, scheduler, device, *, generator=None):
     import torch
     from diffusers import QwenImage21Pipeline
@@ -78,9 +101,10 @@ def flow_loss(transformer, sample, scheduler, device, *, generator=None):
     target = sample["target"].to(device=device, dtype=dtype)
     conds = [x.to(device=device, dtype=dtype) for x in sample["conditions"]]
     noise = torch.randn(target.shape, device=device, dtype=dtype, generator=generator)
-    index = torch.randint(len(scheduler.timesteps), (1,), device=device, generator=generator)
+    batch_size = target.shape[0]
+    index = torch.randint(len(scheduler.timesteps), (batch_size,), device=device, generator=generator)
     timestep = scheduler.timesteps.to(device)[index]
-    sigma = scheduler.sigmas.to(device=device, dtype=dtype)[index].reshape(1, 1, 1, 1, 1)
+    sigma = scheduler.sigmas.to(device=device, dtype=dtype)[index].reshape(batch_size, 1, 1, 1, 1)
     noisy = (1 - sigma) * target + sigma * noise
 
     def pack(z):
@@ -90,14 +114,14 @@ def flow_loss(transformer, sample, scheduler, device, *, generator=None):
     packed = torch.cat([*[pack(z) for z in conds], packed_target], dim=1)
     shapes = [(1, z.shape[-2], z.shape[-1]) for z in [*conds, target]]
     image_mask = sample["image_mask"].to(device)
-    if int(image_mask.sum()) != sum(h * w // 4 for _, h, w in shapes[:-1]):
+    if not torch.all(image_mask.sum(dim=1) == sum(h * w // 4 for _, h, w in shapes[:-1])) or not torch.all(image_mask == image_mask[:1]):
         raise ValueError("Cached image mask does not match condition shapes")
-    image_mask = torch.cat([image_mask, torch.ones((1, target.shape[-2] * target.shape[-1] // 4), dtype=image_mask.dtype, device=device)], dim=1)
+    image_mask = torch.cat([image_mask, torch.ones((batch_size, target.shape[-2] * target.shape[-1] // 4), dtype=image_mask.dtype, device=device)], dim=1)
     prompt_mask = sample["prompt_mask"]
     prediction = transformer(hidden_states=packed,
         encoder_hidden_states=sample["prompt_embeds"].to(device=device, dtype=dtype),
         encoder_hidden_states_mask=None if prompt_mask is None else prompt_mask.to(device),
-        timestep=timestep / 1000, img_shapes=[shapes], img_mask=image_mask, return_dict=False)[0]
+        timestep=timestep / 1000, img_shapes=[shapes] * batch_size, img_mask=image_mask, return_dict=False)[0]
     prediction = prediction[:, -packed_target.shape[1]:]
     expected = pack(noise - target)
     return (prediction.float() - expected.float()).square().mean()
@@ -142,9 +166,13 @@ def train(config, cache_dir, output, *, max_steps=None, resume_from=None,
         raise ValueError("max_steps must be positive")
     accelerator = Accelerator(mixed_precision="bf16", gradient_accumulation_steps=settings["gradient_accumulation_steps"])
     accumulation, world = settings["gradient_accumulation_steps"], accelerator.num_processes
+    micro_batch = settings.get("micro_batch_size", 1)
+    layouts = [r["batch_layout"] for r in receipt["samples"]] if micro_batch > 1 else None
+    padded_size = len(epoch_indices(len(receipt["samples"]), settings["seed"], 0, world, accumulation, micro_batch, layouts))
     contract = {"config_sha256": digest(config), "cache_sha256": digest(receipt), "implementation_sha256": impl,
         "sample_count": len(receipt["samples"]), "world_size": world, "accumulation": accumulation,
-        "sampler": "epoch-permutation-pad-full-effective-batch-v2",
+        "micro_batch_size": micro_batch, "padded_epoch_samples": padded_size,
+        "sampler": "exact-layout-buckets-shuffled-pad-full-effective-batch-v3",
         "validation": None if val_receipt is None else {"cache_sha256": digest(val_receipt), "every": interval,
             "seed": validation_seed, "probe": "one-fixed-noise-and-timestep-per-query-v1"}}
     resumed = checkpoint_receipt(resume_from, contract) if resume_from else None
@@ -156,7 +184,8 @@ def train(config, cache_dir, output, *, max_steps=None, resume_from=None,
     transformer.requires_grad_(False)
     transformer.add_adapter(LoraConfig(r=settings["rank"], lora_alpha=settings["alpha"],
         target_modules=["to_q", "to_k", "to_v", "to_out.0"], init_lora_weights="gaussian"))
-    transformer.enable_gradient_checkpointing()
+    if settings.get("gradient_checkpointing", True):
+        transformer.enable_gradient_checkpointing()
     params = [p for p in transformer.parameters() if p.requires_grad]
     for p in params:
         p.data = p.data.float()
@@ -189,11 +218,12 @@ def train(config, cache_dir, output, *, max_steps=None, resume_from=None,
     if accelerator.is_main_process:
         output.mkdir(parents=True, exist_ok=False)
         write_json(output / "training_metadata.json", {"schema": SCHEMA, "config": config, "cache": receipt,
-            "world_size": world, "effective_batch": world * accumulation, "resume_supported": True,
+            "world_size": world, "effective_batch": world * accumulation * micro_batch,
+            "micro_batch_size": micro_batch, "padded_epoch_samples": padded_size, "resume_supported": True,
             "resumed_from": str(Path(resume_from).resolve()) if resumed else None,
             "starting_progress": progress, "resume_contract": contract,
             "target_latents": "deterministic VAE posterior mode",
-            "padding": "Epochs repeat their permutation prefix to a full effective batch; repeated samples count as seen",
+            "padding": "Exact-layout buckets repeat their prefix to full microbatches; batch order is shuffled, then repeated to a full effective batch; repeated samples count as seen",
             "validation": "Fixed noise/timestep flow-loss proxy; image quality and geometry require generated-view review"})
     accelerator.wait_for_everyone()
 
@@ -256,13 +286,17 @@ def train(config, cache_dir, output, *, max_steps=None, resume_from=None,
 
     if val_receipt:
         validate()  # Same fixed probe at the initial/resumed checkpoint.
+    import time
+    torch.cuda.reset_peak_memory_stats(accelerator.device) if accelerator.device.type == "cuda" else None
+    train_started = time.monotonic()
+    starting_step = progress["step"]
     loss_sum = torch.zeros((), device=accelerator.device)
     while progress["step"] < steps:
-        order = epoch_indices(len(receipt["samples"]), settings["seed"], progress["epoch"], world, accumulation)
-        per_epoch = len(order) // world
+        order = epoch_indices(len(receipt["samples"]), settings["seed"], progress["epoch"], world, accumulation, micro_batch, layouts)
+        per_epoch = len(order) // (world * micro_batch)
         while progress["cursor"] < per_epoch and progress["step"] < steps:
-            index = order[progress["cursor"] * world + accelerator.process_index]
-            sample = sample_at(cache_dir, receipt, index)
+            offset = (progress["cursor"] * world + accelerator.process_index) * micro_batch
+            sample = collate_samples([sample_at(cache_dir, receipt, i) for i in order[offset:offset + micro_batch]])
             with accelerator.accumulate(transformer):
                 with accelerator.autocast():
                     loss = flow_loss(transformer, sample, scheduler, accelerator.device, generator=noise_generator)
@@ -275,12 +309,16 @@ def train(config, cache_dir, output, *, max_steps=None, resume_from=None,
                 optimizer.step()
                 optimizer.zero_grad()
             progress["cursor"] += 1
-            progress["global_samples_seen"] += world
+            progress["global_samples_seen"] += world * micro_batch
             if accelerator.sync_gradients:
                 progress["step"] += 1
                 mean_loss = accelerator.reduce(loss_sum / accumulation, reduction="mean").item()
                 loss_sum.zero_()
-                row = {**progress, "loss": mean_loss, "loss_reduction": "all ranks and all accumulated microbatches"}
+                elapsed = time.monotonic() - train_started
+                row = {**progress, "elapsed_seconds": elapsed,
+                    "samples_per_second": (progress["step"] - starting_step) * world * accumulation * micro_batch / elapsed,
+                    "peak_allocated_gib": torch.cuda.max_memory_allocated(accelerator.device) / 2**30 if accelerator.device.type == "cuda" else 0,
+                    "loss": mean_loss, "loss_reduction": "all ranks and all accumulated microbatches"}
                 if accelerator.is_main_process:
                     with (output / "loss.jsonl").open("a") as stream:
                         stream.write(json.dumps(row) + "\n")

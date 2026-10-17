@@ -45,6 +45,20 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(model.shapes, [[(1, 4, 4), (1, 4, 6), (1, 4, 8)]])
         self.assertEqual(int(model.mask.sum()), 18)
 
+    def test_true_batch_exact_layout_and_per_sample_timesteps(self):
+        from qwen_mvwd.backend import collate_samples
+        samples = [self.sample(), self.sample()]
+        batch = collate_samples(samples)
+        self.assertEqual(batch["target"].shape[0], 2)
+        model = self.transformer(1)
+        self.assertLess(float(self.loss(model, batch)), 1e-12)
+        self.assertEqual(len(model.shapes), 2)
+        self.assertEqual(model.mask.shape[0], 2)
+        # Equal-length prompts with different image positions are also incompatible.
+        samples[1]["image_mask"] = samples[1]["image_mask"].roll(1, dims=1)
+        with self.assertRaisesRegex(ValueError, "identical"):
+            collate_samples(samples)
+
     def test_adapter_receives_gradient(self):
         model = self.transformer(0)
         loss = self.loss(model, self.sample())

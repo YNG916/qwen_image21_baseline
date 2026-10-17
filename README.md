@@ -247,3 +247,16 @@ CPU小模型已验证连续训练/恢复逐位相同，并确认验证不改变�
 
 当前场景平衡工程阶段已实际完成40训练场景/80 episodes/480视图缓存、120→300步完整恢复及固定3场景/18视图验证，使用可选相机提示v1；train/val缓存约10.25/0.37 GiB。32项CPU测试、单/双卡恢复和GPU状态加载审计已完成，GPU独立运行不保证逐位一致。
 同18视图、单seed的120/300步PSNR为9.35/9.02，LPIPS为0.768/0.765，MV-GTWarp-DINO为0.697/0.723（仅6个有效视图对）。真实相机仍近似同一错误画面，布局/机器人形体未达标；这些是工程诊断，不能作为正式test结果。下一步与本机产物位置见 [RUN_NEXT.md](RUN_NEXT.md)。
+
+
+### 四卡训练与实测 batch
+
+`configs/examples/level1_camera_cues_4h100.json` 提供四卡主实验配置。有效batch为 `进程数 × training.micro_batch_size × gradient_accumulation_steps`，`micro_batch_size`默认1；`gradient_checkpointing`默认true，可显式关闭换取速度。实际选择应先用 `scripts/profile_training.py` 测量反向传播和优化器更新，不能根据显存余量推断吞吐。
+
+固定版本的Qwen transformer共享批内RoPE/图像slot布局，因此microbatch>1只将**完全相同token布局和latent形状**的缓存样本组成一批；不右补齐不同长度的文本。采样器打乱桶内样本、再打乱完整batch，桶尾和epoch尾重复的样本计入global_samples_seen。此策略会改变epoch长度与样本权重，训练metadata记录padded_epoch_samples；对较小数据，batch1可避免大量桶尾重复。
+
+特征编码也支持 `run.py run EXP --name encode_train --kind prepare --processes 4 -- --split train --selection SELECTION`。每个进程写独立分片，全部完成后按原始query顺序合并manifest；不读取test监督。`training-state-v3`保存每rank的优化器/RNG和batch采样边界，恢复要求同源码、配置、world size、缓存与验证协议。历史实验请使用自身源码快照。
+
+原集群当前主实验预算、性能测量、日志和结果位置见 [RUN_NEXT.md](RUN_NEXT.md)。`artifacts/`不随Git发布；最终指标以实验receipt和报告为准。
+
+正式对比的数据、训练量与计算预算口径见 [BASELINE_FAIRNESS.md](docs/BASELINE_FAIRNESS.md)。当前4800-query四卡运行属于开发实验，不能直接与Top2Pano的全量十轮训练作最终公平排名。

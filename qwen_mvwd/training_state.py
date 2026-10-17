@@ -7,17 +7,31 @@ from pathlib import Path
 
 from .common import digest, file_hash, read_json, within
 
-SCHEMA = "qwen-mvwd-training-state-v2"
+SCHEMA = "qwen-mvwd-training-state-v3"
 
 
-def epoch_indices(size, seed, epoch, world_size, accumulation):
+def epoch_indices(size, seed, epoch, world_size, accumulation, micro_batch=1, layouts=None):
     import torch
-    if min(size, world_size, accumulation) < 1 or epoch < 0:
+    if min(size, world_size, accumulation, micro_batch) < 1 or epoch < 0:
         raise ValueError("Invalid sampler dimensions")
     generator = torch.Generator().manual_seed(int(digest([seed, "epoch", epoch])[:16], 16))
     order = torch.randperm(size, generator=generator).tolist()
-    total = math.ceil(size / (world_size * accumulation)) * world_size * accumulation
-    return (order * math.ceil(total / size))[:total]
+    if micro_batch > 1:
+        if layouts is None or len(layouts) != size:
+            raise ValueError("Microbatching requires one exact layout key per sample")
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for index in order:
+            buckets[layouts[index]].append(index)
+        batches = []
+        for bucket in buckets.values():
+            count = math.ceil(len(bucket) / micro_batch) * micro_batch
+            padded = (bucket * math.ceil(count / len(bucket)))[:count]
+            batches.extend([padded[i:i + micro_batch] for i in range(0, len(padded), micro_batch)])
+        shuffled = torch.randperm(len(batches), generator=generator).tolist()
+        order = [i for b in shuffled for i in batches[b]]
+    total = math.ceil(len(order) / (world_size * accumulation * micro_batch)) * world_size * accumulation * micro_batch
+    return (order * math.ceil(total / len(order)))[:total]
 
 
 def capture_rng(device, generator):
@@ -41,14 +55,14 @@ def restore_rng(state, device, generator):
         torch.cuda.set_rng_state(state["cuda"], device)
 
 
-def check_progress(progress, size, world_size, accumulation):
+def check_progress(progress, size, world_size, accumulation, micro_batch=1, padded_size=None):
     step, epoch, cursor = (progress[k] for k in ("step", "epoch", "cursor"))
     if any(type(v) is not int or v < 0 for v in (step, epoch, cursor)):
         raise ValueError("Invalid checkpoint progress")
-    per_epoch = math.ceil(size / (world_size * accumulation)) * accumulation
+    per_epoch = (padded_size // (world_size * micro_batch)) if padded_size is not None else math.ceil(size / (world_size * accumulation * micro_batch)) * accumulation
     if cursor >= per_epoch or cursor % accumulation or step != epoch * (per_epoch // accumulation) + cursor // accumulation:
         raise ValueError("Checkpoint progress is not an optimizer boundary")
-    if progress["global_samples_seen"] != step * accumulation * world_size:
+    if progress["global_samples_seen"] != step * accumulation * world_size * micro_batch:
         raise ValueError("Checkpoint sample count mismatch")
 
 
@@ -65,5 +79,6 @@ def checkpoint_receipt(directory, contract):
     for name, checksum in meta["state_files"].items():
         if file_hash(within(directory, name)) != checksum:
             raise ValueError("Checkpoint state checksum mismatch: " + name)
-    check_progress(meta["progress"], contract["sample_count"], contract["world_size"], contract["accumulation"])
+    check_progress(meta["progress"], contract["sample_count"], contract["world_size"], contract["accumulation"],
+                   contract.get("micro_batch_size", 1), contract.get("padded_epoch_samples"))
     return meta

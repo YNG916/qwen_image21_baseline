@@ -31,6 +31,26 @@ export HF_HUB_OFFLINE=1
 
 先用 `nvidia-smi` 检查分配到的卡；CUDA 中的 device 0 不一定是节点物理 GPU 0。
 
+## 2026-10-18 四卡主实验
+
+已使用用户提供的 Slurm allocation `86310`（hkn0905，4×H100，单卡约94 GiB），没有另提交作业。
+实验：`artifacts/mvwd/experiments/20261018_l1_4h100_main_v1/`。
+状态请读 `steps/*.json` 和 `logs/driver.log`；下列预算不表示训练与指标已完成。
+
+- 保留 `bev_frustum_text_v1` 与 GT 对齐的机器人文本资产；不引入局部BEV、机器人mesh渲染或额外GT输入。
+- 40个训练场景×20 episodes×2 frames×3 robots=4800个训练查询；3个独立val场景×10 episodes=180个验证查询。test不参与。
+- 实际测量 batch1/2/4/8/16：关闭梯度检查点时 batch1为1.183样本/秒、50.88 GiB，batch2为1.208样本/秒、87.38 GiB，batch4 OOM。开启后batch1/16为0.872/0.912样本/秒。因此主配置选择每卡batch1、关闭检查点，避免为约2%的吞吐增益挤满显存。
+- 四卡DDP×每卡batch1×梯度累积4=有效batch16；LoRA rank/alpha16、lr5e-5、固定2000次更新=32000次样本访问，约6.67 epochs。1000→2000执行完整状态恢复，非旧单卡300步接续。
+- 编码支持多卡分片；`prepare --processes N`是runner参数：`run.py run EXP --kind prepare --processes 4 -- ...`。
+- 完整驱动：`scripts/run_main_4h100.sh`。该脚本要求实验和选择清单已建立，且val缓存已完成；它只在已有allocation内工作，不执行sbatch。步骤名不可重复。
+- 完成后自动运行zero-shot/1000/2000三组匹配的180图推理，以及PSNR、LPIPS、MV-GTWarp-DINO和固定噪声相机诊断。`--preview`为开发验证，不能称正式test结果。
+- 自动审计与全量三相机对照图：`scripts/summarize_main_experiment.py --experiment artifacts/mvwd/experiments/20261018_l1_4h100_main_v1`，需各步骤成功后执行。
+- 本次冻结源码采用training-state-v3；历史v2实验应使用各自`source/`快照复现，不能用新源码跳过缓存/恢复校验。
+
+已核对Top2Pano实际完成111582 queries×10 epochs；当前开发实验总访问量约少35倍。正式对比协议见 [BASELINE_FAIRNESS.md](docs/BASELINE_FAIRNESS.md)，不能仅对齐step数。
+
+以下保留此前单卡阶段的记录与建议。
+
 ## 当前优先步骤
 
 当前工程实现为 `a6bd52e`，最新实验 `20261017_l1_balanced_resume_v2`。

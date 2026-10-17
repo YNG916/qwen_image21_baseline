@@ -1,0 +1,9 @@
+# Install in a NEW Python 3.11 environment; preserve Top2Pano/metric environments.
+numpy>=1.24,<3
+Pillow>=9.1
+torch>=2.4
+transformers>=5.17
+diffusers @ git+https://github.com/huggingface/diffusers.git@b800f828f3951c4d206e154411bcbfa693cd322e
+accelerate>=1.0
+peft>=0.14
+safetensors

@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+artifacts/
+models/
+.venv/
+
+# Keep machine-specific copies; publish configs/examples instead.
+configs/level1_independent.json
+configs/level1_joint.json
+configs/*.local.json
+
+# External data, checkpoints and credentials are not source files.
+datasets/
+data/
+checkpoints/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+.env
+.env.*
+!.env.example

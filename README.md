@@ -15,6 +15,18 @@
 - 推理不使用目标 RGB/depth/semantic、after 状态、world BEV、场景 mesh 或 GT visibility。仅从 generation_metrics 中提取 trajectory.floor_index 定位楼层，其余结果字段不参与条件。
 - 相机通过标注图与数值文本输入。本版本没有额外 ray encoder、共享显式 3D 状态或几何 loss；不保证严格三维一致性。
 
+## 与其他 baseline 对比的输入协议
+
+本版本保持文本机器人资产条件，不强制增加 mesh 渲染或资产外观消融。
+允许所有方法访问同一份共享机器人资产、实际相机标定、同帧机器人状态；各方法如何编码这些信息属于方法设计，需在结果表中明确披露。
+当前 Qwen 使用资产元数据和 RGB 监督；Top2Pano 带机器人版本使用纹理 mesh 投影与 RGB/depth 训练路径，不能描述为完全相同的条件表达或监督。
+统一 train/val/test、目标分辨率、采样帧和评估指标，报告预训练权重、训练样本范围、预算及 checkpoint 选择规则。
+Level 1 的测试目标视图、场景 mesh、GT depth/semantic/visibility 不得作为生成条件；GT 仅用于训练监督或生成后的评估。
+
+默认共享包为 `MVWD_RobotAssets_v1_gt_aligned`，其中 `chassis_link/visual/top_body` 已按共享可见性修正移除；prompt 部件列表从该包读取。
+这是固定资产版本的修正，不在推理时查询 GT 可见性，也不等于文本条件能硬性保证生成图不幻觉出该外壳。
+其他正常的传感器头、顶盖等部件保留；更换资产包必须记录 manifest 和修正来源。
+
 ## 文件
 
 `qwen_mvwd/data.py`：无模拟器、SAM、Torch 依赖的数据与相机适配。
@@ -132,3 +144,33 @@ MVWD_METRICS_REPO=../top2pano python -m unittest discover -s tests -v
 数学 contract 测试使用小型替身，不能替代真实 Qwen GPU 检查。真实运行状态以各实验 `reports/REVIEW.md` 为准。
 
 下一阶段先做训练小子集的 BEV/相机/机器人条件响应，再开展正式 L1 训练。Level 2 在 L1 路径稳定后添加事件语言化和 before→after 编辑监督。
+
+## 固定噪声的相机响应诊断
+
+保留现有文本机器人资产条件。诊断仅支持 Independent，使用 train/val，默认一个 episode 的第一组固定采样帧。
+每组八个 case：三个真实相机、相机 0 完全重复、相机 0 绕世界 Z 轴旋转 ±30°、沿相机右方向平移 0.5 m、焦距乘 1.25。
+同组全部 case 和不同 checkpoint 共用相机 0 query 派生的实际噪声 seed；参考 BEV、所有机器人 base 状态和资产文本保持一致。
+虚拟查询相机变化不移动机器人，不验证空间碰撞，也没有对应 GT。
+
+```bash
+python run.py create camera_response_v1 \
+  --config configs/level1_independent.json --purpose '固定噪声相机响应诊断'
+python run.py run camera_response_v1 --name inputs --kind camera_diagnose -- \
+  --split train --max-groups 1 --dry-run
+python run.py run camera_response_v1 --name zero_shot --kind camera_diagnose -- \
+  --split train --max-groups 1 --zero-shot --seed 42
+# 对两个 LoRA 分别运行，使用不同步骤名和对应 checkpoint 路径：
+python run.py run camera_response_v1 --name lora100 --kind camera_diagnose -- \
+  --split train --max-groups 1 --lora /path/to/lora/final --seed 42
+python run.py run camera_response_v1 --name lora100_review --kind camera_review -- \
+  --diagnostics artifacts/mvwd/experiments/camera_response_v1/diagnostics/lora100
+```
+
+`camera_diagnostics.py` 的计划/生成路径不读取目标图；`camera_review` 在生成完成后才读取 GT。
+输出包括逐 case 输入、prompt、完整相机、实际 seed、文件 hash，以及人类审阅的目标相机 BEV 射线图（不输入模型）。
+review 生成 GT/预测对照、真实相机 PSNR、与三个真实 GT 的 MSE、重复生成一致性和相对锚点的像素变化。
+虚拟相机不计算 GT 分数；像素变化或最近 GT 判断都不能替代几何遵从评价。
+这些产物使用独立 schema，不能作为正式 benchmark predictions 传入 evaluate。
+
+新增诊断不会改变 data.py、训练损失或旧 LoRA 的输入协议；旧 LoRA 配置、release 和资产校验仍须通过。
+由于实验 runner 和全包实现 hash 已改变，运行需创建新实验；训练缓存继续执行严格 hash 校验，不复用旧缓存进行新训练。

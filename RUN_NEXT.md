@@ -39,16 +39,9 @@ export HF_HUB_OFFLINE=1
 4. 验证后再准备正式全集训练，不直接把 100 或 1000 步当作充分训练。
 5. Level 1 稳定后增加 Level 2：现有三类 event 的语言化、目标定位、before/after 监督和状态执行器。
 
-例如，继续在同一个 12 样本缓存上做新的 300 步诊断（从预训练权重重新开始，**不是恢复 100 步 optimizer**）：
-
-```bash
-python run.py run 20261017_l1_local_snapshot_smoke \
-  --name overfit_train12_300steps --kind train -- \
-  --cache artifacts/mvwd/experiments/20261017_l1_local_snapshot_smoke/features/encode_train12 \
-  --max-steps 300
-```
-
-这个命令尚未作为正式训练配置选定。若修改配置或训练代码，创建新实验并按校验要求重建缓存。
+固定噪声诊断已新增，旧实验的源码 hash 与当前实现不同。请使用新实验；旧缓存不能跳过 hash 校验直接训练。
+当前 300 步小子集实验为 `20261017_l1_overfit300_v1`，其缓存已在新源码下重建，且与旧 12 样本逐 tensor 核验完全一致。
+训练从预训练权重重新开始，不是恢复旧 100 步 optimizer。现已完成300步、相机诊断、六图推理和PSNR检查；结论见该实验 `reports/REVIEW.md`。
 
 ## 正式训练前的工程工作
 
@@ -61,3 +54,31 @@ NPZ 随机帧读取仍可能解压完整视频数组。
 不要根据两个 optimizer steps 或六张验证图宣称几何一致性、相机控制或泛化已成立。
 
 本阶段机器人条件为资产元数据、身份颜色、状态与 BEV 标记；GLB 投影、额外 camera adapter 和几何一致性 loss 是后续独立版本。
+
+## 新增：先运行 camera_diagnose
+
+现已提供固定噪声的相机诊断入口，操作见 README 的“固定噪声的相机响应诊断”。
+保留现有资产文本条件，不新增状态/资产消融。
+使用新实验，依次比较 zero-shot、旧两步 LoRA 和旧 100 步 LoRA；配置使用原本机 Independent JSON。
+两个旧 LoRA 路径分别为：
+
+- `artifacts/mvwd/experiments/20261017_l1_local_snapshot_smoke/training/train_two_steps/final`
+- `artifacts/mvwd/experiments/20261017_l1_local_snapshot_smoke/training/overfit_train12_100steps/final`
+
+先确认 repeat_0 与 recorded_0 像素一致，再检查三个真实相机的 GT 对照，最后人工评价没有 GT 的虚拟相机干预。
+这是训练小子集诊断，不能作为 val/test 泛化结果；通过后用相同入口在 val 上检查。
+
+## 本机新增实验
+
+- `20261017_l1_camera_response_v1`：zero-shot、两步、100步的固定实际噪声相机诊断；24图与GT后处理已完成。
+- `20261017_l1_overfit300_v1`：相同12样本的300步拟合和后续相机复查。
+
+先读前者 `reports/REVIEW.md` 与 `reports/recorded_models_comparison.png`，再读后者的最终报告。
+旧100步模型在当前诊断帧对不同目标相机输出近乎相同墙面；不能仅依据PSNR提高扩大到正式全集训练。
+
+### 300步复查结论
+
+原协议同六个query/seed的训练PSNR：2步7.2014、100步10.6257、300步11.3648 dB。
+固定实际噪声的三相机诊断中，300步仍对目标相机变化不敏感；该训练帧的旋转/平移/焦距干预没有正确透视响应。
+不要把拟合分数提高视为相机控制通过。下一轮先以独立配置测试目标相机BEV位置/视锥标记和简洁朝向描述，机器人资产文本继续保留。
+新条件只能从K/T和已知状态计算，不使用GT depth、场景mesh或visibility。使用新实验并重建编码缓存。

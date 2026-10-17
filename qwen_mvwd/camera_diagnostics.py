@@ -29,7 +29,8 @@ def with_camera(condition, camera):
     if not separator or json.loads(encoded) != condition["payload"]:
         raise ValueError("Condition prompt does not match its structured payload")
     result["prompt"] = prefix + separator + json.dumps(result["payload"], separators=(",", ":"))
-    return result
+    from .camera_conditioning import apply_camera_cues
+    return apply_camera_cues(result, result.get("camera_cue_variant", "matrix_text"))
 
 
 def camera_cases(data, episode_id, frame):
@@ -73,13 +74,17 @@ def camera_cases(data, episode_id, frame):
         for key in ("robot_states", "asset", "local_world_to_bev_pixel"):
             if condition["payload"][key] != reference["payload"][key]:
                 raise ValueError(f"Intervention changed shared {key}")
-        if any(a.tobytes() != b.tobytes() for a, b in zip(condition["images"], reference["images"])):
-            raise ValueError("Camera diagnostic must preserve both input images")
+        actual = [condition["images"][0], condition.get("camera_cue_base_image", condition["images"][1])]
+        expected = [reference["images"][0], reference.get("camera_cue_base_image", reference["images"][1])]
+        if any(a.tobytes() != b.tobytes() for a, b in zip(actual, expected)):
+            raise ValueError("Camera diagnostic must preserve BEV and shared robot annotations")
     return cases
 
 
 def camera_overlay(condition):
     """Target camera rays for human review only; never supplied to Qwen."""
+    if condition.get("camera_cue_variant"):
+        return condition["images"][1].copy()
     image = condition["images"][1].copy()
     draw = ImageDraw.Draw(image)
     camera = condition["cameras"][0]
@@ -115,6 +120,8 @@ def plan(config, args):
             "benchmark_ready": False, "base_seed": args.seed,
             "seed_policy": "anchor robot-0 query seed reused for every case in each group",
             "robot_states_changed": False,
+            "camera_conditioning": config.get("camera_conditioning", "matrix_text"),
+            "input_image_policy": "shared BEV/robot annotations; optional query-camera cues are recomputed per case",
             "counterfactual_gt_available": False,
             "virtual_camera_free_space_validated": False,
             "lora_path": str(Path(args.lora).resolve()) if args.lora else None,

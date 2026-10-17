@@ -80,5 +80,27 @@ NPZ 随机帧读取仍可能解压完整视频数组。
 
 原协议同六个query/seed的训练PSNR：2步7.2014、100步10.6257、300步11.3648 dB。
 固定实际噪声的三相机诊断中，300步仍对目标相机变化不敏感；该训练帧的旋转/平移/焦距干预没有正确透视响应。
-不要把拟合分数提高视为相机控制通过。下一轮先以独立配置测试目标相机BEV位置/视锥标记和简洁朝向描述，机器人资产文本继续保留。
+不要把拟合分数提高视为相机控制通过。该独立配置对照已完成，见下节，机器人资产文本继续保留。
 新条件只能从K/T和已知状态计算，不使用GT depth、场景mesh或visibility。使用新实验并重建编码缓存。
+
+## 新增可选相机条件版本
+
+已新增 `camera_conditioning: bev_frustum_text_v1`，模板为 `configs/examples/level1_camera_cues.json`。
+复制到被Git忽略的 `configs/level1_camera_cues.local.json` 并修改dataset_root，创建新实验。
+第二张条件BEV加入目标相机CAM标记、光轴和2米光学射线扇形，文本加入位置/方向/FOV摘要；机器人资产文本、状态、clean BEV和训练方法保留。
+诊断干预会同步重算标记与文本；具体定义和边界见README。
+
+本机实验：`20261017_l1_camera_cues_v1`，同12个样本、300更新；通过 `reports/cache_control.json` 核对目标和clean BEV latent完全一致。
+原矩阵文本模式的真实八case输入逐字节兼容证明在 `20261017_l1_matrix_compat_v2/reports/compatibility.json`。
+后者同时保存旧矩阵文本300步LoRA在相同val episode上的对照；两者的完整质量结论以各 `reports/REVIEW.md` 为准。
+使用新配置重建缓存并训练新LoRA；原LoRA继续使用原配置与匹配资产，不要混用条件版本。
+
+### 相机提示v1的实际结果与下一阶段
+
+已完成24项测试、300步/1200次样本访问、train/val各6张普通预测、新旧两模式匹配val，以及固定实际噪声的相机诊断。
+原版/新版PSNR：train 11.3648/11.5906，val 7.9376/8.8781 dB。两版的目标、raw BEV、机器人状态、相机与seed匹配，证据见 `paired_conditioning_comparison.json`。
+相机遵从仍未通过：训练同帧的三视角接近同一墙面，val没有正确恢复货架走廊，有错误物体和标记残留。
+训练只覆盖Beechwood_0_garden的2个episodes，val只覆盖grocery_store_half_stocked的1个episode；不得将这些数值作为正式test主表。
+
+下一阶段先扩充训练场景和位姿覆盖，建立场景平衡的小型固定子集；补充optimizer/随机状态恢复和周期性固定val后再扩大训练。
+先判断充分数据/训练是否能建立真实视角关联，再单独评估camera/ray adapter或几何监督。当前正式test和Level2均未启动。

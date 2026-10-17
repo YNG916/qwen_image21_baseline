@@ -188,8 +188,10 @@ class Level1Data:
                   "robot identity labels and base-forward direction lines. These annotations are not scene objects. "
                   "Preserve the scene layout and robot identities, render perspective and occlusions, and include robot bodies wherever visible. "
                   "Do not draw annotations, text, borders or grids in the output. Conditions:\n" + json.dumps(payload, separators=(",", ":")))
-        return {"images": [clean.copy(), annotated], "prompt": prompt, "query": query,
-                "cameras": cameras, "world_to_bev": w2p, "payload": payload}
+        condition = {"images": [clean.copy(), annotated], "prompt": prompt, "query": query,
+                     "cameras": cameras, "world_to_bev": w2p, "payload": payload}
+        from .camera_conditioning import apply_camera_cues
+        return apply_camera_cues(condition, self.config.get("camera_conditioning", "matrix_text"))
 
     def target(self, query):
         record = self.by_id[query["episode_id"]]

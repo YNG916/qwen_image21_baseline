@@ -167,10 +167,36 @@ python run.py run camera_response_v1 --name lora100_review --kind camera_review 
 ```
 
 `camera_diagnostics.py` 的计划/生成路径不读取目标图；`camera_review` 在生成完成后才读取 GT。
-输出包括逐 case 输入、prompt、完整相机、实际 seed、文件 hash，以及人类审阅的目标相机 BEV 射线图（不输入模型）。
+输出包括逐 case 输入、prompt、完整相机、实际 seed、文件 hash，以及审阅用目标相机射线图。默认 matrix_text 模式的审阅射线图不输入模型；下述可选版本明确把相机标记加入第二张条件图。
 review 生成 GT/预测对照、真实相机 PSNR、与三个真实 GT 的 MSE、重复生成一致性和相对锚点的像素变化。
 虚拟相机不计算 GT 分数；像素变化或最近 GT 判断都不能替代几何遵从评价。
 这些产物使用独立 schema，不能作为正式 benchmark predictions 传入 evaluate。
 
-新增诊断不会改变 data.py、训练损失或旧 LoRA 的输入协议；旧 LoRA 配置、release 和资产校验仍须通过。
+默认 matrix_text 保持旧输入协议，训练损失不变；旧 LoRA 配置、release 和资产校验仍须通过。
 由于实验 runner 和全包实现 hash 已改变，运行需创建新实验；训练缓存继续执行严格 hash 校验，不复用旧缓存进行新训练。
+
+## 可选相机条件：bev_frustum_text_v1
+
+这是独立的 Independent 条件版本，默认配置仍为原矩阵文本。配置模板为 `configs/examples/level1_camera_cues.json`：
+
+```bash
+cp configs/examples/level1_camera_cues.json configs/level1_camera_cues.local.json
+# 修改本地 dataset_root，然后使用这个配置创建新实验。
+python run.py create camera_cues_v1 \
+  --config configs/level1_camera_cues.local.json --purpose '目标相机标记与简洁位姿文本对照'
+python run.py run camera_cues_v1 --name inputs --kind camera_diagnose -- \
+  --split train --max-groups 1 --dry-run
+```
+
+`camera_conditioning: bev_frustum_text_v1` 在第二张机器人标注BEV上加入洋红色CAM标记、光轴箭头和固定2米范围的光学边界射线扇形。
+相机位置来自实际RGB camera-to-world，方向来自CV相机+Z，边界射线由K反投影再投到BEV。它不是GT可见性、可通行区域或遮挡估计。
+文本额外给出局部米制相机中心、光轴单位向量、从+X向+Y的水平朝向、pitch及由完整视野边界像素中心计算的FOV；完整K/T仍保留。
+机器人资产文本、身份颜色、全部机器人base状态、clean BEV和训练损失不变；不读取目标RGB/depth/semantic、场景mesh或GT visibility。
+虚拟相机诊断会从原机器人标注BEV重画相机提示，并重算文本，避免旧标记/摘要残留。默认矩阵文本模式仍保持两张条件图不变。
+
+该版本需要自己的编码缓存和LoRA，不能用旧LoRA直接推理；与旧版比较时匹配query、目标图、训练预算和生成seed，而不是要求条件图/文本hash相同。
+本轮控制实验使用相同12个训练样本、rank16、学习率5e-5、梯度累积4、300个更新，从预训练权重重新开始。小子集结果不代表泛化或正式benchmark。
+
+本机该版本已通过24项测试，并完成同12样本/300步及一个held-out val episode的真实GPU对照。
+原版/提示版六图PSNR为train 11.36/11.59、val 7.94/8.88 dB；固定噪声对照仍有相机不敏感、布局错误和标记残留。
+这些是单场景训练的小样本诊断，不能判相机遵从通过或作为正式benchmark；本版本保留为可复现的可选实验，不替换默认条件。

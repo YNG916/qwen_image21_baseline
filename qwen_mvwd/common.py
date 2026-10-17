@@ -51,6 +51,11 @@ def load_config(path):
         raise ValueError("Invalid robots")
     if not config["model"].get("revision") or config["model"]["revision"] == "main":
         raise ValueError("Pin a model revision (not main)")
+    camera_variant = config.get("camera_conditioning", "matrix_text")
+    if camera_variant not in ("matrix_text", "bev_frustum_text_v1"):
+        raise ValueError("Unknown camera_conditioning variant")
+    if camera_variant == "bev_frustum_text_v1" and config["mode"] != "independent":
+        raise ValueError("BEV camera cues require independent mode")
     settings = config["training"]
     if settings["rank"] < 1 or settings["alpha"] != settings["rank"]:
         raise ValueError("First implementation requires alpha == rank > 0 for portable LoRA scaling")

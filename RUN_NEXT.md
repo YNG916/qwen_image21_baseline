@@ -31,13 +31,36 @@ export HF_HUB_OFFLINE=1
 
 先用 `nvidia-smi` 检查分配到的卡；CUDA 中的 device 0 不一定是节点物理 GPU 0。
 
-## 接下来优先做什么
+## 当前优先步骤
 
-1. 查看训练子集的预测与 GT 对照，确认透视输出、机器人身份和朝向是否开始学习。
-2. 固定生成 seed 比较同帧三个实际相机，再增加相机位置/方向干预的独立诊断；像素变化不等于控制正确。
-3. 扩大到按训练场景平衡选取的小子集，继续用 val 选模；不要用 test 调参。
-4. 验证后再准备正式全集训练，不直接把 100 或 1000 步当作充分训练。
-5. Level 1 稳定后增加 Level 2：现有三类 event 的语言化、目标定位、before/after 监督和状态执行器。
+当前工程实现为 `a6bd52e`，最新实验 `20261017_l1_balanced_resume_v2`。
+已固定40训练场景/80 episodes/480视图和3验证场景/18视图；缓存实测10.25/0.37 GiB。场景ID不重叠，房间类型、朝向和FOV覆盖仍有限。
+先查看该实验 `reports/REVIEW.md`、`reports/comparisons*`、`reports/data_support_camera_comparison.png`，以实际完成的步骤为准。
+
+1. 用同一批val图和固定噪声诊断判断相机控制、机器人身份及布局；flow loss、PSNR下降/上升均不能替代图像检查。
+2. 先在固定小子集检验相机条件是否能充分拟合，并检查原始BEV的局部细节/朝向编码；从已知相机导出的局部BEV可作为新实验。不要只因flow loss下降就直接开长训。下方命令保留为同配置/源码/缓存的恢复示例，固定18-query flow探针。
+3. 另用 `select --split val --episodes-per-scene 3` 建立更大的val图像支持，再用相同checkpoint和seed推理；无需更改训练的val-cache恢复协议。不要用test调参。
+4. 检查RGB BEV的遮挡/分辨率限制。若充分训练后仍不能跟随实际相机，再单独评估camera/ray adapter；保留现有文本资产条件。
+5. Level1的基本视角和布局稳定后，再规划正式训练/test以及Level2的指令、状态更新和before/after监督。
+
+本阶段300步终点完成后，下一次在有效GPU shell内可使用：
+
+```bash
+source ~/.config/multiview/storage.sh
+cd "$MULTIVIEW_STORAGE_ROOT/baselines/qwen_image21"
+qwen_python="$MULTIVIEW_STORAGE_ROOT/envs/qwen-image21/bin/python"
+exp_root=artifacts/mvwd/experiments/20261017_l1_balanced_resume_v2
+export HF_HUB_OFFLINE=1
+"$qwen_python" run.py run 20261017_l1_balanced_resume_v2 \
+  --name balanced1000 --kind train -- \
+  --cache "$exp_root/features/encode_train480" \
+  --validation-cache "$exp_root/features/encode_val18" --validate-every 40 \
+  --resume-from "$exp_root/training/balanced300/final" --max-steps 1000
+```
+
+这是恢复用法示例，不表示300步已被验证集选为最佳模型；是否继续应先查看生成图和最终报告。1000是总更新数，不是额外1000步；该配置仍只使用480-query小子集，不是全集训练。新步骤名不能与已有步骤重复。改变代码或恢复协议需要新实验，不能跳过hash校验。
+
+## 以下为历史实验记录
 
 固定噪声诊断已新增，旧实验的源码 hash 与当前实现不同。请使用新实验；旧缓存不能跳过 hash 校验直接训练。
 当前 300 步小子集实验为 `20261017_l1_overfit300_v1`，其缓存已在新源码下重建，且与旧 12 样本逐 tensor 核验完全一致。
@@ -126,3 +149,20 @@ H100单卡4步与2→4步、双卡2步与1→2步均完成；双卡12样本补�
 GPU只读审计 `reports/restore_audit.json` 确认LoRA、AdamW以及随机状态在加载后与断点完全一致。
 独立启动的BF16训练未达到逐位一致：单卡/双卡最终adapter最大绝对差约3.32e-4/1.99e-4；差异已在中断前出现。对应JSON保留 `passed_exact: false`，不能把它报告为GPU精确重现通过。各rank采样进度和随机状态一致，恢复起点固定val与保存前一致。
 缓存/预算在 `reports/stage_plan.json`；相机条件覆盖单独记录，正式test与Level2均未开始。
+
+
+### 本阶段最终结果（2026-10-18）
+
+已完成480-query缓存、120步→完整恢复至300步、两个终点各18张固定val图、同一GPU/同一实现的三指标，以及8case固定噪声相机复查；23个runner步骤均exit0。
+缓存train/val实测10.2527/0.3743 GiB；最终checkpoint为 `training/balanced300/final`，step300/epoch2/cursor240/1200次样本访问。120、250、300步均有完整且有限的256张量LoRA/optimizer状态，120步参考保留。
+
+| 更新数 | PSNR ↑ | LPIPS ↓ | MV-GTWarp-DINO ↑ |
+| --- | ---: | ---: | ---: |
+| 120 | 9.347860 | 0.768392 | 0.696741 |
+| 300 | 9.017678 | 0.765130 | 0.722660 |
+
+这是3 episodes、单seed、18视图和6个有效GT重叠视图对的preview，未算FID，未运行正式test。固定val flow从0.364313降到0.323090，但图像几何仍未通过。
+三个场景首帧的9张普通预测仍有旋转/俯视、布局和机器人形体错误。另一个匹配旧实验的val帧中，8cases输入/几何/实际seed逐hash相同；300步新模型仍输出近似同一错误房间，真实三相机PSNR约4.80/4.93/4.57，repeat像素一致，虚拟相机不打GT分数。
+
+完整证据：该实验 `reports/REVIEW.md`、`final_summary.json`、`comparisons_val120_val300/` 和 `data_support_camera_comparison.png`。
+机器人资产文本和隐藏top_body的共享定义保留；不能把生成形体正确性视为已解决。下一阶段优先诊断相机输入表示和BEV可见信息；1000步命令只是恢复示例，当前300步不是被验证选定的最佳模型。

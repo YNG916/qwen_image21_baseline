@@ -49,7 +49,7 @@ export HF_HUB_OFFLINE=1
 按当前格式粗略外推，全集 Independent 缓存约 2 TiB；需要先规划配额、分片与条件缓存复用。
 NPZ 随机帧读取仍可能解压完整视频数组。
 
-训练目前没有 optimizer 恢复、自动 val/early stopping 或学习率搜索；正式长训前应补充这些功能。
+新版已补充 optimizer/随机状态/采样进度恢复及固定 val flow-loss 探针，使用方法见 README。自动 early stopping 和学习率搜索仍未加入；真实图像验证需单独运行 infer/evaluate。
 多卡入口通过 `run ... --processes N --kind train` 调用 Accelerate，实际多卡验证状态以 REVIEW.md 为准。
 不要根据两个 optimizer steps 或六张验证图宣称几何一致性、相机控制或泛化已成立。
 
@@ -104,3 +104,25 @@ NPZ 随机帧读取仍可能解压完整视频数组。
 
 下一阶段先扩充训练场景和位姿覆盖，建立场景平衡的小型固定子集；补充optimizer/随机状态恢复和周期性固定val后再扩大训练。
 先判断充分数据/训练是否能建立真实视角关联，再单独评估camera/ray adapter或几何监督。当前正式test和Level2均未启动。
+
+
+## 场景平衡与恢复工程阶段
+
+新实验：`20261017_l1_balanced_resume_v2`。v1 的 select 子命令分发失败保留日志，v2 已修复并加入 CLI 回归测试。
+
+- `selections/train80/selection.json`：40个训练场景，每场景2 episodes，共80 episodes/480固定视图。
+- `selections/val3/selection.json`：3个验证场景，每场景1 episode，共3 episodes/18固定视图。
+- `selections/train_smoke/selection.json`：2个训练场景/2 episodes/12视图，用于真实模型的恢复验证。
+- `diagnostics/train80_plan`、`val3_plan`：只读元数据的查询数量核对，不读取GT。
+- `reports/cpu_tests.log`：CPU检查；训练循环测试核对连续/恢复一致及验证不改变训练结果。
+
+该实验使用可选相机提示v1，不改动文本机器人资产条件。最终 GPU 核验与缓存/训练预算以本实验 `reports/REVIEW.md` 为准。480视图训练与18视图验证是小规模阶段，仍不代表正式test。
+
+
+### 恢复核验结果
+
+32项CPU测试通过；实际训练循环的连续/恢复与插入验证两项等价性均通过。
+H100单卡4步与2→4步、双卡2步与1→2步均完成；双卡12样本补齐为16次访问，正确恢复到epoch1/cursor0。
+GPU只读审计 `reports/restore_audit.json` 确认LoRA、AdamW以及随机状态在加载后与断点完全一致。
+独立启动的BF16训练未达到逐位一致：单卡/双卡最终adapter最大绝对差约3.32e-4/1.99e-4；差异已在中断前出现。对应JSON保留 `passed_exact: false`，不能把它报告为GPU精确重现通过。各rank采样进度和随机状态一致，恢复起点固定val与保存前一致。
+缓存/预算在 `reports/stage_plan.json`；相机条件覆盖单独记录，正式test与Level2均未开始。

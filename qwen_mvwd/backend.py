@@ -103,29 +103,53 @@ def flow_loss(transformer, sample, scheduler, device, *, generator=None):
     return (prediction.float() - expected.float()).square().mean()
 
 
-def train(config, cache_dir, output, *, max_steps=None):
+def train(config, cache_dir, output, *, max_steps=None, resume_from=None,
+          validation_cache=None, validate_every=None, validation_seed=137):
     import json
     import torch
     from accelerate import Accelerator
     from accelerate.utils import set_seed
     from diffusers import FlowMatchEulerDiscreteScheduler, QwenImage21Pipeline, QwenImage21Transformer2DModel
     from peft import LoraConfig
-    from peft.utils import get_peft_model_state_dict
+    from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
+    from safetensors.torch import load_file
     from .common import digest, file_hash, implementation_hash, read_json, within, write_json
+    from .training_state import SCHEMA, capture_rng, restore_rng, epoch_indices, checkpoint_receipt
     require_gpu()
     cache_dir, output = Path(cache_dir), Path(output)
-    receipt = read_json(cache_dir / "manifest.json")
-    if receipt["config_sha256"] != digest(config) or receipt["dataset"]["split"] != "train" or not receipt["complete"]:
-        raise ValueError("Training requires a complete train cache with identical config")
-    if receipt["implementation_sha256"] != implementation_hash():
-        raise ValueError("Feature encoding implementation changed; rebuild cache")
-    if not receipt["samples"]:
-        raise ValueError("Empty cache")
+    impl = implementation_hash()
+
+    def read_cache(directory, split):
+        receipt = read_json(Path(directory) / "manifest.json")
+        if (receipt["config_sha256"] != digest(config) or receipt["dataset"]["split"] != split
+                or not receipt["complete"] or not receipt["samples"]):
+            raise ValueError(f"Requires a complete nonempty {split} cache with identical config")
+        if receipt["implementation_sha256"] != impl:
+            raise ValueError("Feature encoding implementation changed; rebuild cache")
+        return receipt
+
+    receipt = read_cache(cache_dir, "train")
+    val_receipt = read_cache(validation_cache, "val") if validation_cache else None
+    if val_receipt and any(val_receipt["dataset"].get(k) != receipt["dataset"].get(k)
+                           for k in ("release_id", "robot_assets")):
+        raise ValueError("Train/val cache release or robot assets differ")
+    if validate_every is not None and (validate_every < 1 or not val_receipt):
+        raise ValueError("validate_every must be positive and requires a val cache")
     settings = config["training"]
+    interval = (validate_every or settings["checkpoint_every"]) if val_receipt else None
     steps = settings["max_steps"] if max_steps is None else max_steps
     if steps < 1:
         raise ValueError("max_steps must be positive")
     accelerator = Accelerator(mixed_precision="bf16", gradient_accumulation_steps=settings["gradient_accumulation_steps"])
+    accumulation, world = settings["gradient_accumulation_steps"], accelerator.num_processes
+    contract = {"config_sha256": digest(config), "cache_sha256": digest(receipt), "implementation_sha256": impl,
+        "sample_count": len(receipt["samples"]), "world_size": world, "accumulation": accumulation,
+        "sampler": "epoch-permutation-pad-full-effective-batch-v2",
+        "validation": None if val_receipt is None else {"cache_sha256": digest(val_receipt), "every": interval,
+            "seed": validation_seed, "probe": "one-fixed-noise-and-timestep-per-query-v1"}}
+    resumed = checkpoint_receipt(resume_from, contract) if resume_from else None
+    if resumed and steps <= resumed["step"]:
+        raise ValueError("max_steps is a total target and must exceed resumed step")
     set_seed(settings["seed"])
     source = model_source(config)
     transformer = QwenImage21Transformer2DModel.from_pretrained(source, subfolder="transformer", torch_dtype=torch.bfloat16)
@@ -133,72 +157,143 @@ def train(config, cache_dir, output, *, max_steps=None):
     transformer.add_adapter(LoraConfig(r=settings["rank"], lora_alpha=settings["alpha"],
         target_modules=["to_q", "to_k", "to_v", "to_out.0"], init_lora_weights="gaussian"))
     transformer.enable_gradient_checkpointing()
-    # FP32 trainable adapter parameters, BF16 frozen backbone, under Accelerator autocast.
     params = [p for p in transformer.parameters() if p.requires_grad]
     for p in params:
         p.data = p.data.float()
+    if resumed:
+        state = load_file(str(Path(resume_from) / "pytorch_lora_weights.safetensors"))
+        state = {k.removeprefix("transformer."): v for k, v in state.items()}
+        if set(state) != set(get_peft_model_state_dict(transformer)):
+            raise ValueError("Resume adapter key set differs")
+        result = set_peft_model_state_dict(transformer, state)
+        if result.unexpected_keys:
+            raise ValueError("Unexpected adapter keys")
     optimizer = torch.optim.AdamW(params, lr=settings["learning_rate"], weight_decay=0.01)
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(source, subfolder="scheduler")
     if not scheduler.config.use_dynamic_shifting:
         raise ValueError("This implementation expects the base 2.1 dynamic-shift scheduler")
-
-    class CacheDataset(torch.utils.data.Dataset):
-        def __len__(self):
-            return len(receipt["samples"])
-        def __getitem__(self, index):
-            row = receipt["samples"][index]
-            path = within(cache_dir, row["path"])
-            if file_hash(path) != row["sha256"]:
-                raise ValueError("Feature cache checksum mismatch")
-            return torch.load(path, map_location="cpu", weights_only=True)
-
-    loader = torch.utils.data.DataLoader(CacheDataset(), batch_size=1, shuffle=True, collate_fn=lambda xs: xs[0], num_workers=0)
-    transformer, optimizer, loader = accelerator.prepare(transformer, optimizer, loader)
+    transformer, optimizer = accelerator.prepare(transformer, optimizer)
+    noise_generator = torch.Generator(device=accelerator.device).manual_seed(settings["seed"] + accelerator.process_index)
+    progress = {"step": 0, "epoch": 0, "cursor": 0, "global_samples_seen": 0}
+    if resumed:
+        local = torch.load(Path(resume_from) / f"state_rank_{accelerator.process_index:04d}.pt",
+                           map_location="cpu", weights_only=True)
+        if local["progress"] != resumed["progress"]:
+            raise ValueError("Rank/checkpoint progress mismatch")
+        optimizer.load_state_dict(local["optimizer"])
+        if accelerator.scaler is not None:
+            accelerator.scaler.load_state_dict(local["scaler"])
+        restore_rng(local["rng"], accelerator.device, noise_generator)
+        progress = dict(resumed["progress"])
     transformer.train()
-    output.mkdir(parents=True, exist_ok=True)
-    step, epoch, seen = 0, 0, 0
     if accelerator.is_main_process:
-        write_json(output / "training_metadata.json", {"config": config, "cache": receipt,
-            "world_size": accelerator.num_processes, "effective_batch": accelerator.num_processes * settings["gradient_accumulation_steps"],
-            "resume_supported": False, "target_latents": "deterministic VAE posterior mode"})
+        output.mkdir(parents=True, exist_ok=False)
+        write_json(output / "training_metadata.json", {"schema": SCHEMA, "config": config, "cache": receipt,
+            "world_size": world, "effective_batch": world * accumulation, "resume_supported": True,
+            "resumed_from": str(Path(resume_from).resolve()) if resumed else None,
+            "starting_progress": progress, "resume_contract": contract,
+            "target_latents": "deterministic VAE posterior mode",
+            "padding": "Epochs repeat their permutation prefix to a full effective batch; repeated samples count as seen",
+            "validation": "Fixed noise/timestep flow-loss proxy; image quality and geometry require generated-view review"})
+    accelerator.wait_for_everyone()
+
+    def sample_at(directory, manifest, index):
+        row = manifest["samples"][index]
+        path = within(directory, row["path"])
+        if file_hash(path) != row["sha256"]:
+            raise ValueError("Feature cache checksum mismatch")
+        return torch.load(path, map_location="cpu", weights_only=True)
 
     def save(name):
         accelerator.wait_for_everyone()
+        dest = output / name
         if accelerator.is_main_process:
-            dest = output / name
             dest.mkdir(exist_ok=False)
             state = get_peft_model_state_dict(accelerator.unwrap_model(transformer))
             QwenImage21Pipeline.save_lora_weights(str(dest), transformer_lora_layers=state, safe_serialization=True)
-            write_json(dest / "metadata.json", {"step": step, "epoch": epoch, "global_samples_seen": seen,
+        accelerator.wait_for_everyone()
+        torch.save({"progress": dict(progress), "optimizer": optimizer.state_dict(),
+            "rng": capture_rng(accelerator.device, noise_generator),
+            "scaler": accelerator.scaler.state_dict() if accelerator.scaler is not None else None},
+            dest / f"state_rank_{accelerator.process_index:04d}.pt")
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            files = ["pytorch_lora_weights.safetensors", *[f"state_rank_{i:04d}.pt" for i in range(world)]]
+            write_json(dest / "metadata.json", {"schema": SCHEMA, "complete": True,
+                **progress, "progress": dict(progress), "resume_contract": contract,
+                "state_files": {name: file_hash(dest / name) for name in files},
                 "config_sha256": digest(config), "cache_identity": receipt["cache_identity"],
                 "config": config, "dataset": receipt["dataset"], "trainable_parameters": sum(p.numel() for p in params)})
         accelerator.wait_for_everyone()
 
-    while step < steps:
-        for sample in loader:
+    def validate():
+        # Dedicated probes plus complete RNG restoration keep validation out of the training noise stream.
+        rng = capture_rng(accelerator.device, noise_generator)
+        model = accelerator.unwrap_model(transformer)
+        model.eval()
+        total = torch.zeros(2, dtype=torch.float64, device=accelerator.device)
+        try:
+            with torch.no_grad(), accelerator.autocast():
+                for index in range(accelerator.process_index, len(val_receipt["samples"]), world):
+                    seed = int(digest([validation_seed, val_receipt["cache_identity"], val_receipt["samples"][index]["query"]])[:16], 16)
+                    generator = torch.Generator(device=accelerator.device).manual_seed(seed)
+                    loss = flow_loss(model, sample_at(validation_cache, val_receipt, index), scheduler,
+                                     accelerator.device, generator=generator)
+                    if not torch.isfinite(loss):
+                        raise FloatingPointError("Nonfinite validation flow loss")
+                    total[0] += loss.double()
+                    total[1] += 1
+            total = accelerator.reduce(total, reduction="sum")
+            row = {"step": progress["step"], "flow_loss": (total[0] / total[1]).item(),
+                   "queries": int(total[1].item()), "protocol": contract["validation"]}
+            if accelerator.is_main_process:
+                with (output / "validation.jsonl").open("a") as stream:
+                    stream.write(json.dumps(row) + "\n")
+                print({"validation": row}, flush=True)
+        finally:
+            model.train()
+            restore_rng(rng, accelerator.device, noise_generator)
+
+    if val_receipt:
+        validate()  # Same fixed probe at the initial/resumed checkpoint.
+    loss_sum = torch.zeros((), device=accelerator.device)
+    while progress["step"] < steps:
+        order = epoch_indices(len(receipt["samples"]), settings["seed"], progress["epoch"], world, accumulation)
+        per_epoch = len(order) // world
+        while progress["cursor"] < per_epoch and progress["step"] < steps:
+            index = order[progress["cursor"] * world + accelerator.process_index]
+            sample = sample_at(cache_dir, receipt, index)
             with accelerator.accumulate(transformer):
                 with accelerator.autocast():
-                    loss = flow_loss(transformer, sample, scheduler, accelerator.device)
+                    loss = flow_loss(transformer, sample, scheduler, accelerator.device, generator=noise_generator)
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Nonfinite flow loss")
                 accelerator.backward(loss)
+                loss_sum += loss.detach()
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(params, 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-            seen += accelerator.num_processes
+            progress["cursor"] += 1
+            progress["global_samples_seen"] += world
             if accelerator.sync_gradients:
-                step += 1
-                mean_loss = accelerator.reduce(loss.detach(), reduction="mean").item()
+                progress["step"] += 1
+                mean_loss = accelerator.reduce(loss_sum / accumulation, reduction="mean").item()
+                loss_sum.zero_()
+                row = {**progress, "loss": mean_loss, "loss_reduction": "all ranks and all accumulated microbatches"}
                 if accelerator.is_main_process:
-                    row = {"step": step, "epoch": epoch, "loss": mean_loss, "global_samples_seen": seen}
                     with (output / "loss.jsonl").open("a") as stream:
                         stream.write(json.dumps(row) + "\n")
                     print(row, flush=True)
-                if step % settings["checkpoint_every"] == 0:
-                    save(f"step_{step:06d}")
-                if step >= steps:
+                # Canonical next-sample cursor, including checkpoints exactly at epoch boundaries.
+                if progress["cursor"] == per_epoch:
+                    progress["epoch"] += 1
+                    progress["cursor"] = 0
+                if val_receipt and (progress["step"] % interval == 0 or progress["step"] == steps):
+                    validate()
+                if progress["step"] % settings["checkpoint_every"] == 0:
+                    save(f"step_{progress['step']:06d}")
+                if progress["cursor"] == 0:
                     break
-        epoch += 1
     save("final")
     accelerator.end_training()

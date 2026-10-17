@@ -14,7 +14,7 @@ import traceback
 from qwen_mvwd.common import file_hash, load_config, read_json, write_json
 
 ROOT = Path(__file__).resolve().parent
-KINDS = {"inspect": "diagnostics", "prepare": "features", "train": "training", "infer": "predictions", "evaluate": "evaluations", "camera_diagnose": "diagnostics", "camera_review": "reports"}
+KINDS = {"select": "selections", "inspect": "diagnostics", "prepare": "features", "train": "training", "infer": "predictions", "evaluate": "evaluations", "camera_diagnose": "diagnostics", "camera_review": "reports"}
 
 
 def utc():

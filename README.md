@@ -35,6 +35,8 @@ Level 1 的测试目标视图、场景 mesh、GT depth/semantic/visibility 不�
 
 `qwen_mvwd/tasks.py`：数据检查、缓存、推理与现有指标 API 的文件适配。
 
+`qwen_mvwd/selection.py`：场景平衡固定清单；`training_state.py`：确定性采样、随机状态和断点完整性检查。
+
 `run.py`：不可变配置、源码快照、唯一命令/日志/退出码记录。
 
 ## 环境
@@ -111,7 +113,7 @@ Independent 和 Joint 的训练缓存及 LoRA 不可混用。
 没有新增 depth/geometry loss，GT depth 只在评估中使用。
 
 编码缓存会记录每个 tensor 文件 hash、配置/实现 hash 和完整样本选择。先测 12 个样本的磁盘量，再规划全量缓存；不能把全数据集条件编码放到内存。
-本版缓存和训练不支持中断恢复。失败步骤保留，使用新步骤名重试；已保存 LoRA 可直接推理。
+编码缓存暂不支持中断续写；失败步骤保留，使用新步骤名重试。新版训练支持下述完整断点恢复；旧 LoRA-only checkpoint 仍只用于推理。
 正式长训前先验证全部目标 attention 参数有有限梯度、检查条件响应，并在 val 上选模。
 当前 `max_steps=1000` 是起点配置，不是已经选定的充分训练预算。
 
@@ -200,3 +202,44 @@ python run.py run camera_cues_v1 --name inputs --kind camera_diagnose -- \
 本机该版本已通过24项测试，并完成同12样本/300步及一个held-out val episode的真实GPU对照。
 原版/提示版六图PSNR为train 11.36/11.59、val 7.94/8.88 dB；固定噪声对照仍有相机不敏感、布局错误和标记残留。
 这些是单场景训练的小样本诊断，不能判相机遵从通过或作为正式benchmark；本版本保留为可复现的可选实验，不替换默认条件。
+
+
+## 场景平衡子集、固定验证与训练恢复
+
+`selection.py` 从已校验的官方 split 元数据生成清单，不读取 GT。按 SHA256(seed, scene/episode) 排序，每个场景取相同数量 episode，再按轮次交错场景。清单固定 release、split hash、episode/scene、机器人及帧采样协议，可同时用于 `inspect`、`prepare`、`infer` 的 `--selection`；不能再叠加 `--scene` 或 `--max-episodes`。省略清单时保留旧入口行为，`--max-episodes` 仍是 split 前缀。
+
+以下为 Independent 小规模阶段：train 每场景2个 episode（40场景/80 episodes/480视图），val 每场景1个（3场景/3 episodes/18视图）；各 episode 仍为固定2帧×3机器人。不要用 test 设计子集或选择 checkpoint。
+
+```bash
+python run.py create balanced_l1_v1 --config configs/level1_camera_cues.local.json \
+  --purpose '场景平衡训练与固定val'
+exp_root=artifacts/mvwd/experiments/balanced_l1_v1
+python run.py run balanced_l1_v1 --name train80 --kind select -- \
+  --split train --episodes-per-scene 2 --selection-seed 42
+python run.py run balanced_l1_v1 --name val3 --kind select -- \
+  --split val --episodes-per-scene 1 --selection-seed 42
+python run.py run balanced_l1_v1 --name train_features --kind prepare -- \
+  --split train --selection "$exp_root/selections/train80/selection.json"
+python run.py run balanced_l1_v1 --name val_features --kind prepare -- \
+  --split val --selection "$exp_root/selections/val3/selection.json"
+python run.py run balanced_l1_v1 --name train250 --kind train -- \
+  --cache "$exp_root/features/train_features" \
+  --validation-cache "$exp_root/features/val_features" --validate-every 50 --max-steps 250
+python run.py run balanced_l1_v1 --name continue500 --kind train -- \
+  --cache "$exp_root/features/train_features" \
+  --validation-cache "$exp_root/features/val_features" --validate-every 50 --max-steps 500 \
+  --resume-from "$exp_root/training/train250/final"
+python run.py run balanced_l1_v1 --name val500 --kind infer -- \
+  --split val --selection "$exp_root/selections/val3/selection.json" \
+  --lora "$exp_root/training/continue500/final" --seed 42
+```
+
+`prepare` 允许 train/val，禁止 test；val 的 GT 编码只用于验证损失，推理仍从原始条件独立构造输入，不读取此缓存或目标图。
+`validation.jsonl` 在开始/恢复时、指定间隔及最终更新处记录全部固定 val queries 的 flow MSE。每个 query 固定噪声和 timestep，并隔离/恢复训练随机状态。它是去噪代理指标；checkpoint 质量还要运行固定 seed 的 val 生成、现有 `evaluate --preview` 和相机诊断，不能根据该损失宣称几何准确。
+
+新版 checkpoint 包含可直接推理的 LoRA、每 rank 的 AdamW/随机状态、下一个采样位置及完整性 hash；不保存冻结的完整 Qwen 权重。`--max-steps` 是包含已完成步骤的总目标。仅在完整 optimizer 边界保存。恢复要求相同代码、配置、缓存、GPU进程数和验证协议；旧 LoRA-only checkpoint 不支持 optimizer 恢复。换配置/数据/进程数属于新实验。
+CPU小模型已验证连续训练/恢复逐位相同，并确认验证不改变训练结果；真实H100上已逐项审计LoRA、AdamW与随机状态恢复。默认BF16 GPU的独立训练存在数值差异，固定seed和保存RNG不保证跨运行逐位相同。
+
+训练按 seed 和 epoch 固定打乱；每 epoch 将排列前缀重复补齐至完整有效 batch，日志的样本访问量包含补齐项。loss 现为全部累积 microbatches 和 ranks 的均值，与历史只记录最后一个 microbatch 的日志数值不宜直接比较。尚未加入自动 early stopping 或学习率调度。
+
+本机工程验证记录见 `RUN_NEXT.md`；该阶段仍保留机器人资产文本和隐藏 top_body 的共享资产定义。

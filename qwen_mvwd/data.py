@@ -33,7 +33,7 @@ def check_pose(pose):
 
 
 class Level1Data:
-    def __init__(self, config, split, *, scenes=None, max_episodes=None):
+    def __init__(self, config, split, *, scenes=None, max_episodes=None, selection=None):
         self.config = config
         self.root = Path(config["dataset_root"]).expanduser().resolve()
         self.meta = read_json(self.root / "dataset.json")
@@ -48,6 +48,15 @@ class Level1Data:
         records = [__import__("json").loads(s) for s in path.read_text().splitlines() if s.strip()]
         if len(records) != self.meta["splits"][split]["count"] or any(r["split"] != split for r in records):
             raise ValueError("Split count/assignment mismatch")
+        self.selection_hash = None
+        if selection is not None:
+            if scenes or max_episodes is not None:
+                raise ValueError("Use selection alone, without scene/max_episodes overrides")
+            from .selection import selected_records
+            manifest = read_json(selection)
+            records = selected_records(manifest, records, config=config, split=split,
+                split_hash=self.split_hash, release=self.meta["release_id"])
+            self.selection_hash = manifest["selection_sha256"]
         if scenes:
             if set(scenes) - {r["scene"] for r in records}:
                 raise ValueError("Selected scene is absent from split")
@@ -99,7 +108,8 @@ class Level1Data:
                     yield {"episode_id": record["id"], "frame_index": frame, "robots": robots}
 
     def provenance(self):
-        return {"release_id": self.meta["release_id"], "split": self.split,
+        return {**({"selection_sha256": self.selection_hash} if self.selection_hash else {}),
+                "release_id": self.meta["release_id"], "split": self.split,
                 "split_sha256": self.split_hash, "episode_ids": [r["id"] for r in self.records],
                 "robot_assets": {"manifest_sha256": file_hash(self.assets_root / "manifest.json"),
                                   "asset_id": self.asset_manifest["asset_id"]},

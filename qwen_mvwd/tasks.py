@@ -12,7 +12,7 @@ from .data import Level1Data
 
 
 def select_data(config, args):
-    return Level1Data(config, args.split, scenes=args.scene, max_episodes=args.max_episodes)
+    return Level1Data(config, args.split, scenes=args.scene, max_episodes=args.max_episodes, selection=getattr(args, "selection", None))
 
 
 def inspect(config, args):
@@ -46,8 +46,8 @@ def prepare(config, args):
     import torch
     from .backend import encode_sample, load_pipeline, require_gpu
     require_gpu()
-    if args.split != "train":
-        raise ValueError("This first training cache only accepts the train split")
+    if args.split not in ("train", "val"):
+        raise ValueError("Feature caches accept train/val only; no test supervision during development")
     data = select_data(config, args)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
@@ -70,7 +70,7 @@ def prepare(config, args):
         write_json(output / "manifest.json", receipt)
         print(f"Cached {i+1} samples", flush=True)
     receipt["complete"] = True
-    receipt["selection_limited"] = args.max_samples is not None or args.max_episodes is not None or bool(args.scene)
+    receipt["selection_limited"] = args.max_samples is not None or args.max_episodes is not None or bool(args.scene) or bool(getattr(args, "selection", None))
     write_json(output / "manifest.json", receipt)
 
 

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import subprocess
 
 from qwen_mvwd.common import read_json, write_json
@@ -153,3 +153,20 @@ class TrainingOwnershipTests(ExperimentFixture):
         self.assertEqual(command[command.index("--name") + 1], "train60_psnr")
         self.assertEqual(command[command.index("--predictions") + 1], str(self.exp / "predictions/train60"))
         self.assertFalse(list((self.exp / "steps").iterdir()))
+
+
+class ProcessCleanupTests(unittest.TestCase):
+    def test_interruption_terminates_the_entire_accelerate_process_group(self):
+        def interrupted_output():
+            raise KeyboardInterrupt("fixture")
+            yield
+        child = MagicMock()
+        child.pid = 12345
+        child.stdout = interrupted_output()
+        with patch.object(workflow.subprocess, "Popen", return_value=child) as start, \
+             patch.object(workflow.os, "killpg") as stop:
+            with self.assertRaises(KeyboardInterrupt):
+                workflow.stream_command(["fixture"], io.StringIO())
+        self.assertTrue(start.call_args.kwargs["start_new_session"])
+        stop.assert_called_once_with(12345, workflow.signal.SIGTERM)
+        child.wait.assert_called_once_with(timeout=30)

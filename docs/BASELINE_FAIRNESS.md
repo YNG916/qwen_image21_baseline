@@ -12,7 +12,7 @@ The 20261018 four-H100 Qwen run is a development experiment. It is not a trainin
 | Epochs over those queries | 10 | 6.667 |
 | Nominal sample visits excluding distributed padding | 1,115,820 | 32,000 |
 | Effective batch | 64 | 16 |
-| Optimizer updates | 17,440 actual | 2,000 planned |
+| Optimizer updates | 17,440 actual | 2,000 completed |
 | Validation queries | 8,100 | 180 |
 
 Top2Pano sources (local, not included in this Git repository):
@@ -32,3 +32,9 @@ For the main controlled comparison:
 6. Also report compute: GPU model/count, elapsed training/validation time and GPU-hours. Report feature/SAM preprocessing and inference cost separately so cached pipelines do not hide their preparation expense. A fixed-compute-budget result is useful as a separately labeled comparison, using the same allowed training pool; it is not a fixed-data-exposure result.
 
 With effective batch16 and Qwen's sampler, full-data ten-epoch training would require `ceil(111582/16) × 10 = 69,740` optimizer updates. This is a budget calculation, not an experiment already launched or an ETA. A 48-hour allocation does not itself establish feasibility; measure actual DDP speed and cache storage first. The current development pipeline is retained unchanged so generated-view quality can inform whether a full-data run is warranted.
+
+## Prepared full-data recipe
+
+`20261018_l1_full10ep_4h100_v1` has a CPU-verified plan through `./mvwd full`; no full-data GPU training result is implied by setup. It matches all actual train episode/frame/robot identities, train/val split snapshots and GT-aligned robot asset manifest to the completed Top2Pano run. It uses111582/8100 full train/val queries, effective batch16,6974 updates/epoch,69740 updates over10 epochs, and1115840 actual sample visits including20 padding repeats. It initializes fresh LoRA from the pinned pretrained Qwen backbone; the development subset checkpoint is not a warm start.
+
+The Qwen primary result is predeclared as the fixed ten-epoch endpoint. Full-val fixed-noise flow loss is recorded for diagnostics; it is not image quality or geometric accuracy. Top2Pano's existing run selected a checkpoint by val loss, so compare fixed-budget endpoints when available and separately label any best-validation variants rather than claiming identical selection rules. All data/compute exposure, padding, preparation, retries and architectural/supervision differences still need disclosure. See [full training](FULL_TRAINING.md).

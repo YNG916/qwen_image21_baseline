@@ -25,10 +25,23 @@ export MVWD_METRICS_PYTHON=/path/to/mvwd-metrics/bin/python
 默认复用本地模型缓存（`HF_HUB_OFFLINE=1`）；首次下载需显式设置 `HF_HUB_OFFLINE=0`。
 所有相对路径以 repo 根目录为基准。GPU 命令需要先进入你自己申请的 Slurm allocation；入口不会申请资源或提交任务。
 
+## 全量公平训练
+
+本机已准备 `20261018_l1_full10ep_4h100_v1`，对齐Top2Pano的111,582个训练查询和10 epochs；尚未启动GPU任务。
+在你申请的四卡H100 shell中执行：
+
+```bash
+./mvwd full 20261018_l1_full10ep_4h100_v1 --stage all --through-epoch 10
+```
+
+中断后进入新的四卡allocation，重复同一命令即可复用编码块并从最近完整状态恢复。每1,000步及每epoch保存完整checkpoint，日志与资源使用自动归档。先看计划可用 `--stage plan`；先跑1个epoch可用 `--through-epoch 1`。
+容量估算、恢复约束、checkpoint位置与推理命令见[全量训练指南](docs/FULL_TRAINING.md)。
+
 ## 常用操作
 
 | 命令 | 功能 |
 |---|---|
+| `./mvwd full EXP --stage setup/plan/prepare/train/all` | 全量训练计划、编码、训练及自动恢复 |
 | `./mvwd init EXP --config FILE` | 创建实验，冻结配置和源码 |
 | `./mvwd init EXP --from OLD_EXP` | 复用配置，开始另一轮独立训练 |
 | `./mvwd select EXP NAME …` | 建立固定训练/验证子集 |

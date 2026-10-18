@@ -8,3 +8,5 @@
 - Place comparison images beside the corresponding predictions. Preserve original prediction pixels, dataset files and robot assets. Use checksums and reject conflicting existing exports.
 - `run.py` and `qwen_mvwd/` define frozen training/cache/resume contracts. Avoid changing them for workflow-only improvements; historical experiments have strict source/config checks.
 - New workflow utilities live in `tools/`. One-off historical utilities live in `tools/legacy/`; the README must show the current simple workflow.
+
+- The full-data four-H100 recipe is `./mvwd full EXP --stage ...` in `tools/full_training.py`. Preserve its frozen plan, identical full query support, complete-state checkpoint recovery, hard-linked feature assembly, and per-attempt logs. Setup/plan are CPU metadata work; prepare/train/all are explicit GPU actions.

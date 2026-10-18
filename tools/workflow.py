@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -138,6 +139,11 @@ def refresh(experiment):
             metric_lines.append(f"| {key} | {mean_text} | {value.get('episode_count', '—')} | {ci_text} |")
         (path.parent / "METRICS.md").write_text("\n".join(metric_lines) + "\n")
         lines.append(f"| [{path.parent.name}](../evaluations/{path.parent.name}/metrics.json) | {cell('psnr')} | {cell('lpips')} | {cell('mv_gtwarp_dino')} | {scope} |")
+    if (experiment / "plans/full_training.json").exists():
+        lines += ["", "## Full-data training", "", "[Frozen plan](../plans/full_training.json)"]
+        for name in ("FULL_TRAINING.md", "CHECKPOINTS.json"):
+            if (experiment / "reports" / name).exists():
+                lines.append(f"[{name}]({name})")
     imports = sorted((experiment / "provenance").glob("*/REDIRECT.json"))
     if imports:
         lines += ["", "## Imported diagnostics", ""]
@@ -170,7 +176,7 @@ def refresh_index():
 
 
 def snapshot_tools(experiment):
-    files = [ROOT / "mvwd", ROOT / "review_predictions.py", ROOT / "tools/workflow.py", ROOT / "tools/visualizations.py"]
+    files = [ROOT / "mvwd", ROOT / "review_predictions.py", ROOT / "tools/workflow.py", ROOT / "tools/visualizations.py", ROOT / "tools/full_training.py"]
     hashes = {str(p.relative_to(ROOT)): file_hash(p) for p in files}
     identity = digest(hashes)
     directory = experiment / "source/automation" / identity
@@ -189,7 +195,7 @@ def stream_command(command, log):
     print("Running:", json.dumps(command, ensure_ascii=False), flush=True)
     log.write(json.dumps({"argv": command, "started_utc": utc()}) + "\n"); log.flush()
     child = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, env={**os.environ, "PYTHONUNBUFFERED": "1"})
+                             text=True, start_new_session=True, env={**os.environ, "PYTHONUNBUFFERED": "1"})
     try:
         for line in child.stdout:
             log.write(line); log.flush(); print(line, end="", flush=True)
@@ -197,8 +203,18 @@ def stream_command(command, log):
         if code:
             raise subprocess.CalledProcessError(code, command)
     except BaseException:
-        if child.poll() is None:
-            child.terminate(); child.wait()
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
         raise
 
 
@@ -308,12 +324,25 @@ def main(argv=None):
             p.add_argument("--name", dest="eval_name", help="Unique evaluation name; allows multiple evaluations of the same inference")
         if action == "review":
             p.add_argument("--name", dest="review_name", help="Unique review step name when retrying")
+    full = sub.add_parser("full", help="Full-data four-H100 setup, encoding, training and automatic recovery")
+    full.add_argument("experiment")
+    full.add_argument("--stage", choices=("setup", "plan", "prepare", "train", "all"), default="plan")
+    full.add_argument("--dataset-root", help="Setup only; defaults to the workspace MVWD dataset")
+    full.add_argument("--reference", help="Setup only; completed Top2Pano experiment for exact data-protocol checks")
+    full.add_argument("--chunk-episodes", type=int, default=1024, help="Setup only; bounded, restartable encoding partitions")
+    full.add_argument("--through-epoch", type=int, default=10, help="Cumulative training target,1..10; default10")
+    full.add_argument("--dry-run", action="store_true")
     status = sub.add_parser("status", help="Show results and refresh the artifact index")
     status.add_argument("experiment", nargs="?")
     args, extra = parser.parse_known_args(argv)
     if extra[:1] == ["--"]:
         extra = extra[1:]
-    if args.action == "init":
+    if args.action == "full":
+        if extra:
+            parser.error("Unrecognized full arguments: " + " ".join(extra))
+        from tools.full_training import main_full
+        main_full(args)
+    elif args.action == "init":
         if extra:
             parser.error("Unrecognized init arguments: " + " ".join(extra))
         simple_name(args.experiment)

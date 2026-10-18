@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ from qwen_mvwd.common import read_json, write_json
 from tools import workflow
 
 
-class WorkflowTests(unittest.TestCase):
+class ExperimentFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -35,6 +36,8 @@ class WorkflowTests(unittest.TestCase):
         return argparse.Namespace(action=action, experiment="example", name="train60", dry_run=dry,
                                   review_name=None, processes=1)
 
+
+class WorkflowTests(ExperimentFixture):
     def test_dry_run_has_no_side_effects_and_includes_post_generation_review(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), patch.object(workflow, "stream_command", side_effect=AssertionError("Unexpected execution")):
@@ -81,3 +84,72 @@ class WorkflowTests(unittest.TestCase):
              patch.object(workflow, "stream_command", side_effect=AssertionError("GPU launched")):
             with self.assertRaisesRegex(RuntimeError, "existing GPU allocation"):
                 workflow.run_workflow(self.args("eval"), ["--preview", "--device", "cpu", "--device=cuda"])
+
+
+class TrainingOwnershipTests(ExperimentFixture):
+    def test_checkpoint_short_name_resolves_inside_training(self):
+        args = self.args(dry=True)
+        args.checkpoint = "main2000/final"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            workflow.run_workflow(args, ["--split", "train"])
+        self.assertIn(str(self.exp / "training/main2000/final"), out.getvalue())
+        self.assertFalse(list((self.exp / "steps").iterdir()))
+
+    def test_cross_training_inputs_rejected_before_any_write_or_execution(self):
+        other = self.experiments / "other"
+        cases = [
+            ("infer", ["--lora", str(other / "training/main/final")]),
+            ("train", ["--resume-from=" + str(other / "training/main/final")]),
+            ("eval", ["--predictions", str(self.exp / "predictions/a"), str(other / "predictions/b")]),
+        ]
+        for action, extra in cases:
+            with self.subTest(action=action), patch.object(workflow, "stream_command", side_effect=AssertionError("Unexpected execution")):
+                with self.assertRaisesRegex(ValueError, "must belong"):
+                    workflow.run_workflow(self.args(action, dry=True), extra)
+        self.assertFalse(list((self.exp / "steps").iterdir()))
+
+    def test_checkpoint_cannot_escape_or_conflict_with_other_model_flags(self):
+        for checkpoint, extra in [("../other/final", []), ("/outside", []),
+                                  ("main/final", ["--zero-shot"]), ("main/final", ["--lora=x"])]:
+            args = self.args(dry=True)
+            args.checkpoint = checkpoint
+            with self.subTest(checkpoint=checkpoint, extra=extra), self.assertRaises(ValueError):
+                workflow.run_workflow(args, extra)
+
+    def test_legacy_alias_routes_new_inference_into_training_experiment(self):
+        alias = self.experiments / "old_diagnostic"
+        write_json(alias / "REDIRECT.json", {"experiment": "example"})
+        args = self.args(dry=True)
+        args.experiment = "old_diagnostic"
+        args.checkpoint = "main2000/final"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            workflow.run_workflow(args, [])
+        commands = [json.loads(line)["argv"] for line in out.getvalue().splitlines()]
+        self.assertEqual(commands[0][3], "example")
+        self.assertIn(str(self.exp / "predictions/train60"), commands[1])
+        workflow.refresh_index()
+        self.assertNotIn("old_diagnostic", (self.artifacts / "EXPERIMENTS.md").read_text())
+
+    def test_legacy_alias_status_refreshes_owner_and_rejects_redirect_cycles(self):
+        alias = self.experiments / "old_diagnostic"
+        write_json(alias / "REDIRECT.json", {"experiment": "example"})
+        with contextlib.redirect_stdout(io.StringIO()):
+            workflow.main(["status", "old_diagnostic"])
+        self.assertTrue((self.exp / "reports/OVERVIEW.md").exists())
+        self.assertFalse((alias / "reports").exists())
+        write_json(self.exp / "REDIRECT.json", {"experiment": "old_diagnostic"})
+        with self.assertRaisesRegex(ValueError, "redirect cycle"):
+            workflow.resolve_experiment("old_diagnostic")
+
+
+    def test_multiple_evaluations_keep_the_same_inference_and_training(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            workflow.main(["eval", "example", "train60", "--name", "train60_psnr", "--preview", "--metrics", "psnr", "--dry-run"])
+        command = json.loads(out.getvalue())["argv"]
+        self.assertEqual(command[3], "example")
+        self.assertEqual(command[command.index("--name") + 1], "train60_psnr")
+        self.assertEqual(command[command.index("--predictions") + 1], str(self.exp / "predictions/train60"))
+        self.assertFalse(list((self.exp / "steps").iterdir()))

@@ -8,7 +8,7 @@ import sys
 import time
 
 p=argparse.ArgumentParser();p.add_argument('--experiment',required=True);p.add_argument('--timeout-hours',type=float,default=12);a=p.parse_args()
-root=Path(__file__).resolve().parents[1];experiment=Path(a.experiment).resolve();end=time.monotonic()+a.timeout_hours*3600
+root=Path(__file__).resolve().parents[2];experiment=Path(a.experiment).resolve();end=time.monotonic()+a.timeout_hours*3600
 status_path=experiment/'reports/LIVE_STATUS.json'
 while time.monotonic()<end:
     steps={}
@@ -28,7 +28,7 @@ while time.monotonic()<end:
         raise SystemExit('Experiment step failed; inspect LIVE_STATUS.json and logs; no automatic retry/reconfiguration')
     if (experiment/'reports/DRIVER_COMPLETE.txt').exists():
         with (experiment/'logs/final_audit.log').open('x') as log:
-            subprocess.run([sys.executable,str(root/'scripts/summarize_main_experiment.py'),'--experiment',str(experiment)],cwd=root,stdout=log,stderr=subprocess.STDOUT,check=True)
+            subprocess.run([sys.executable,str(root/'tools/legacy/summarize_main_experiment.py'),'--experiment',str(experiment)],cwd=root,stdout=log,stderr=subprocess.STDOUT,check=True)
         (experiment/'reports/AUDIT_COMPLETE.txt').write_text(datetime.datetime.now(datetime.timezone.utc).isoformat()+'\n')
         print('Completed final audit, metrics summary and matched-view grids',flush=True)
         break

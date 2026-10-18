@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# One human-facing entry. It never requests a Slurm allocation or submits jobs.
+set -euo pipefail
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$HOME/.config/multiview/storage.sh" ]]; then
+  source "$HOME/.config/multiview/storage.sh"
+fi
+workspace_root="${MULTIVIEW_STORAGE_ROOT:-$(cd "$repo_root/../.." && pwd)}"
+if [[ "${1:-}" == eval ]]; then
+  task_python="${MVWD_METRICS_PYTHON:-$workspace_root/envs/mvwd-metrics/bin/python}"
+else
+  task_python="${QWEN_PYTHON:-$workspace_root/envs/qwen-image21/bin/python}"
+fi
+if [[ ! -x "$task_python" ]]; then
+  echo "Python environment missing: $task_python" >&2
+  echo "Set QWEN_PYTHON and MVWD_METRICS_PYTHON to your environment executables." >&2
+  exit 2
+fi
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+cd "$repo_root"
+exec "$task_python" tools/workflow.py "$@"

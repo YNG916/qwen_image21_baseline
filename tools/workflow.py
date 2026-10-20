@@ -176,7 +176,7 @@ def refresh_index():
 
 
 def snapshot_tools(experiment):
-    files = [ROOT / "mvwd", ROOT / "review_predictions.py", ROOT / "tools/workflow.py", ROOT / "tools/visualizations.py", ROOT / "tools/full_training.py"]
+    files = [ROOT / "mvwd", ROOT / "review_predictions.py", ROOT / "tools/workflow.py", ROOT / "tools/visualizations.py", ROOT / "tools/full_training.py", ROOT / "tools/slurm.py", ROOT / "slurm/full_train_4h100.sbatch"]
     hashes = {str(p.relative_to(ROOT)): file_hash(p) for p in files}
     identity = digest(hashes)
     directory = experiment / "source/automation" / identity
@@ -332,12 +332,24 @@ def main(argv=None):
     full.add_argument("--chunk-episodes", type=int, default=1024, help="Setup only; bounded, restartable encoding partitions")
     full.add_argument("--through-epoch", type=int, default=10, help="Cumulative training target,1..10; default10")
     full.add_argument("--dry-run", action="store_true")
+    batch = sub.add_parser("batch", help="Explicitly submit full-training Slurm jobs; never called automatically")
+    batch.add_argument("experiment")
+    batch.add_argument("--stage", choices=("train", "all", "prepare"), default="train")
+    batch.add_argument("--through-epoch", type=int, default=10)
+    batch.add_argument("--after", help="Start after this job ends, including timeout/failure (afterany)")
+    batch.add_argument("--chain", type=int, default=1, help="Queue 1..8 sequential jobs; default1; each resumes the same experiment")
+    batch.add_argument("--dry-run", action="store_true", help="Print sbatch commands without submitting or writing files")
     status = sub.add_parser("status", help="Show results and refresh the artifact index")
     status.add_argument("experiment", nargs="?")
     args, extra = parser.parse_known_args(argv)
     if extra[:1] == ["--"]:
         extra = extra[1:]
-    if args.action == "full":
+    if args.action == "batch":
+        if extra:
+            parser.error("Unrecognized batch arguments: " + " ".join(extra))
+        from tools.slurm import submit
+        submit(args)
+    elif args.action == "full":
         if extra:
             parser.error("Unrecognized full arguments: " + " ".join(extra))
         from tools.full_training import main_full

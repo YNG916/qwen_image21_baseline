@@ -10,3 +10,5 @@
 - New workflow utilities live in `tools/`. One-off historical utilities live in `tools/legacy/`; the README must show the current simple workflow.
 
 - The full-data four-H100 recipe is `./mvwd full EXP --stage ...` in `tools/full_training.py`. Preserve its frozen plan, identical full query support, complete-state checkpoint recovery, hard-linked feature assembly, and per-attempt logs. Setup/plan are CPU metadata work; prepare/train/all are explicit GPU actions.
+
+- Slurm launchers live in `slurm/`. Only explicit `./mvwd batch` (or user-invoked sbatch) submits jobs. Preserve per-experiment submission/execution receipts, immutable submitted-script snapshots, Slurm logs, and afterany sequencing. Creating or testing a launcher does not authorize submitting/cancelling jobs.

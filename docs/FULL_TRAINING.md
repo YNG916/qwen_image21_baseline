@@ -6,7 +6,7 @@
 exp=20261018_l1_full10ep_4h100_v1
 ```
 
-没有开始编码或训练。与开发实验独立，从固定 Qwen 预训练模型初始化新的 LoRA。后续训练、续训、infer、eval 全部使用该 experiment。
+这是与开发实验独立的一次训练，从固定 Qwen 预训练模型初始化新的 LoRA。实际进度以reports与日志为准。后续训练、续训、infer、eval 全部使用该 experiment。
 
 ## 运行
 
@@ -24,11 +24,68 @@ exp=20261018_l1_full10ep_4h100_v1
 ./mvwd full "$exp" --stage all --through-epoch 10
 ```
 
-工具不申请 allocation，也不提交 Slurm。需要恰好四张可见 H100。普通 shell 前台执行；关闭终端会影响任务，请在已有的持久会话中运行。
+`full`命令不会申请allocation或提交Slurm，需要恰好四张可见H100。交互式shell前台执行时，关闭终端会影响任务；无需保持终端的方式见下方batch提交。
 
 当前速度的训练主体线性估计约70小时，另有编码、全验证及保存开销；这不是全量实测 ETA。48小时 allocation 预计需要跨 allocation 恢复。进入新的同规格 allocation 后，**重复同一条 `--stage all` 命令**即可：已完成编码块会复用，训练自动读取最近完整 checkpoint；无需填写恢复路径。
 
 如果希望先查看一个完整 epoch，可先用 `--through-epoch 1`，检查后再改成10；配置、缓存和恢复协议不变。只编码或只训练分别使用 `--stage prepare` / `--stage train`。这些阶段不会自动进行图像生成或测试集评估。
+
+## 使用sbatch后台排队、自动续训
+
+Slurm脚本统一放在 [slurm/full_train_4h100.sbatch](../slurm/full_train_4h100.sbatch)。资源与原交互作业一致：账户`hk-project-test-p0029577`、`gpu-h100`、单节点4GPU、64CPU、384G内存、48小时。一个srun task内部启动四个Accelerate训练进程，不能改成四个Slurm task重复启动。
+
+在**登录节点**提交，不用先申请交互allocation，也不需要手动激活环境：
+
+```bash
+source ~/.config/multiview/storage.sh
+cd "$MULTIVIEW_STORAGE_ROOT/baselines/qwen_image21"
+exp=20261018_l1_full10ep_4h100_v1
+
+# 先看命令，不提交、不写产物：
+./mvwd batch "$exp" --dry-run
+
+# 提交一份48小时作业，默认直接使用完整缓存续训：
+./mvwd batch "$exp"
+```
+
+提交命令返回job ID后可关闭终端。训练启动时自动检查最新完整checkpoint；提交时不绑定旧checkpoint，因此排队期间前一个作业新增的进度也能被发现。完整缓存尚未建立的新训练使用`--stage all`；通过`--through-epoch 1`等参数可设置累计目标，默认10。
+
+需要提前排两份串行作业，或者接在一个正在排队/运行的作业后：
+
+```bash
+./mvwd batch "$exp" --chain 2
+./mvwd batch "$exp" --after EXISTING_JOB_ID
+```
+
+两条是不同用法的示例，不应都执行。`--chain 2`立即提交两份作业，第二份依赖第一份的`afterany`；`--after`让第一份依赖指定job。超时或失败也会满足afterany，因此后继作业仍可从完整状态恢复；不使用只接受成功退出的afterok。它不是无限自提交：默认只交一份，chain明确限定1..8份。若预算已经完成，后继作业启动检查后不再训练额外epoch，但仍会短暂申请资源。
+
+避免为同一experiment同时保留无依赖的交互申请和batch申请。已有PENDING交互申请时，可自行取消后改用batch；若保留该作业先执行训练，则使用`--after JOB_ID`。已有driver锁还会阻止并发训练，但这不能替代正确的排队依赖。
+
+每次提交先保存不可变的脚本快照，再把该快照交给sbatch；修改repo脚本不会悄悄改变已排队脚本。核心代码/配置仍受原有hash约束，不应在训练期间修改。
+
+- Slurm合并stdout/stderr：`logs/slurm-JOB_ID.log`。
+- 提交命令、job IDs、依赖及失败输出：`steps/slurm_submission_*.workflow.json`及同名logs。
+- 实际job的开始/结束、退出码、环境：`steps/slurm_job_JOB_ID_restart_0.json`。
+- 提交/执行的脚本快照：`source/slurm/`。
+- 原始训练、checkpoint、GPU监控：沿用原来的training/logs/reports结构。
+
+脚本在时限前约3分钟接收停止信号，并转发给driver做退出与记录。**该信号不触发即时checkpoint**；仍从最近周期保存的完整状态恢复。脚本不自动requeue，作业结束后是否还有后继作业取决于显式提交的依赖/chain。
+
+```bash
+squeue -u "$USER"
+tail -f "artifacts/mvwd/experiments/$exp/logs/slurm-JOB_ID.log"
+sacct -j JOB_ID --format=JobID,State,Elapsed,ExitCode
+```
+
+也支持直接sbatch；需从repo根目录提交，并显式指定experiment日志位置：
+
+```bash
+root="artifacts/mvwd/experiments/$exp"
+sbatch --chdir="$PWD" --output="$PWD/$root/logs/slurm-%j.log" \
+  slurm/full_train_4h100.sbatch "$exp" train 10
+```
+
+直接sbatch绕过提交回执/提交前检查，但实际运行回执和脚本快照仍会生成。`./mvwd batch`提供更完整的归档，优先使用它。当前experiment也可直接`sbatch slurm/full_train_4h100.sbatch`，脚本默认值指向它；其他experiment应显式传参和output。
 
 ## 固定协议和效率配置
 

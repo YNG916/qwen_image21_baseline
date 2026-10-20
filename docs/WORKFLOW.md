@@ -1,7 +1,7 @@
 # 日常操作
 
-从repo根目录使用 `./mvwd`；入口自动选择Qwen或metrics Python。需要GPU的操作只在已有Slurm allocation里执行。
-可以先用 `--dry-run`查看即将执行的命令。工具不会申请节点、提交Slurm作业或在后台自动开始下一轮训练。
+从repo根目录使用 `./mvwd`；入口自动选择Qwen或metrics Python。直接GPU操作在已有Slurm allocation里执行；`./mvwd batch EXP` 是显式的后台作业提交入口。
+可以先用 `--dry-run`查看即将执行的命令。只有显式调用batch才会提交Slurm作业；其他入口不会申请节点或自动排队。
 
 全量四卡H100 baseline使用 [全量训练指南](FULL_TRAINING.md) 的 `./mvwd full`；以下保留通用小实验操作。
 

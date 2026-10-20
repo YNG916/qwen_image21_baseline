@@ -23,12 +23,20 @@ export MVWD_METRICS_PYTHON=/path/to/mvwd-metrics/bin/python
 ```
 
 默认复用本地模型缓存（`HF_HUB_OFFLINE=1`）；首次下载需显式设置 `HF_HUB_OFFLINE=0`。
-所有相对路径以 repo 根目录为基准。GPU 命令需要先进入你自己申请的 Slurm allocation；入口不会申请资源或提交任务。
+所有相对路径以 repo 根目录为基准。直接运行GPU命令需要已有Slurm allocation；显式的 `./mvwd batch` 可以提交后台批处理作业。其他命令不会自动提交作业。
 
 ## 全量公平训练
 
-本机已准备 `20261018_l1_full10ep_4h100_v1`，对齐Top2Pano的111,582个训练查询和10 epochs；尚未启动GPU任务。
-在你申请的四卡H100 shell中执行：
+本机已准备 `20261018_l1_full10ep_4h100_v1`，对齐Top2Pano的111,582个训练查询和10 epochs；运行状态见该experiment的reports与日志。
+不想等待交互式节点时，在登录节点提交：
+
+```bash
+./mvwd batch 20261018_l1_full10ep_4h100_v1
+```
+
+它使用 [slurm/full_train_4h100.sbatch](slurm/full_train_4h100.sbatch)，自动排队、运行和恢复；Slurm日志也归入同一experiment。可用 `--after JOB_ID` 接在现有作业后，或 `--chain 2` 预排两份串行作业。只预览提交命令使用 `--dry-run`。默认stage为train，需要完整缓存；首次编码用 `--stage all`。
+
+也可以在你申请的四卡H100 shell中直接执行：
 
 ```bash
 ./mvwd full 20261018_l1_full10ep_4h100_v1 --stage all --through-epoch 10
@@ -41,6 +49,7 @@ export MVWD_METRICS_PYTHON=/path/to/mvwd-metrics/bin/python
 
 | 命令 | 功能 |
 |---|---|
+| `./mvwd batch EXP [--after JOB_ID] [--chain N]` | 显式提交全量训练batch作业，自动恢复并记录Slurm日志 |
 | `./mvwd full EXP --stage setup/plan/prepare/train/all` | 全量训练计划、编码、训练及自动恢复 |
 | `./mvwd init EXP --config FILE` | 创建实验，冻结配置和源码 |
 | `./mvwd init EXP --from OLD_EXP` | 复用配置，开始另一轮独立训练 |

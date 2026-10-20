@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One human-facing entry. It never requests a Slurm allocation or submits jobs.
+# One human-facing entry. Only the explicit batch command submits Slurm jobs.
 set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$HOME/.config/multiview/storage.sh" ]]; then
